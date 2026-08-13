@@ -51,7 +51,14 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 
 
 APP_NAME = "蓝电数据工作台"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
+
+PLOT_MODE_LABELS = {
+    "原始时序图": "time",
+    "多电池均值＋误差棒": "statistics",
+    "多电池 Stack 分层图": "stack",
+}
+ERROR_BAR_LABELS = {"标准差 SD": "sd", "标准误 SEM": "sem", "不显示": "none"}
 
 
 def enable_windows_dpi_awareness() -> None:
@@ -873,6 +880,186 @@ def export_selected_data(
     workbook.save(output)
 
 
+@dataclass
+class CycleMetricStatistics:
+    cycles: np.ndarray
+    mean: np.ndarray
+    sd: np.ndarray
+    sem: np.ndarray
+    n: np.ndarray
+    values: np.ndarray
+
+
+def compute_cycle_statistics(
+    datasets: Sequence[LandDataset],
+    metric_key: str,
+    cycle_start: int,
+    cycle_end: int,
+) -> CycleMetricStatistics:
+    """Aggregate one cycle-summary metric across files, aligned by cycle number."""
+    metric = METRIC_BY_KEY[metric_key]
+    if metric.source != "cycle":
+        raise ValueError(f"{metric.display} 不是逐圈汇总指标，不能用于多电池统计。")
+    if cycle_start < 1 or cycle_end < cycle_start:
+        raise ValueError("统计圈数范围无效。")
+
+    cycles = np.arange(cycle_start, cycle_end + 1, dtype=int)
+    values = np.full((len(datasets), len(cycles)), np.nan, dtype=float)
+    for dataset_index, dataset in enumerate(datasets):
+        for cycle_index, cycle in enumerate(cycles):
+            summary = dataset.cycles.get(int(cycle))
+            value = summary.values.get(metric_key) if summary else None
+            if value is not None and math.isfinite(value):
+                values[dataset_index, cycle_index] = value
+
+    n = np.sum(np.isfinite(values), axis=0).astype(int)
+    mean = np.full(len(cycles), np.nan, dtype=float)
+    sd = np.full(len(cycles), np.nan, dtype=float)
+    sem = np.full(len(cycles), np.nan, dtype=float)
+    for index, count in enumerate(n):
+        if count == 0:
+            continue
+        column = values[:, index]
+        valid = column[np.isfinite(column)]
+        mean[index] = float(np.mean(valid))
+        # A single available cell is drawn with a zero-length error bar instead of a blank.
+        sd[index] = float(np.std(valid, ddof=1)) if count >= 2 else 0.0
+        sem[index] = sd[index] / math.sqrt(count)
+    return CycleMetricStatistics(cycles, mean, sd, sem, n, values)
+
+
+def statistics_wide_headers(datasets: Sequence[LandDataset], metric_keys: Sequence[str]) -> list[str]:
+    headers = ["Cycle (X)"]
+    for key in metric_keys:
+        metric = METRIC_BY_KEY[key]
+        unit = f" ({metric.unit})" if metric.unit else ""
+        headers.extend(
+            [
+                f"{metric.label} Mean{unit} (Y)",
+                f"{metric.label} SD{unit} (YErr)",
+                f"{metric.label} SEM{unit} (YErr)",
+                f"{metric.label} n",
+                *[f"{metric.label} | {dataset.path.name}{unit}" for dataset in datasets],
+            ]
+        )
+    return headers
+
+
+def iter_statistics_wide_rows(
+    datasets: Sequence[LandDataset],
+    metric_keys: Sequence[str],
+    cycle_start: int,
+    cycle_end: int,
+) -> Iterator[list[Any]]:
+    results = {
+        key: compute_cycle_statistics(datasets, key, cycle_start, cycle_end) for key in metric_keys
+    }
+    for cycle_index, cycle in enumerate(range(cycle_start, cycle_end + 1)):
+        if not any(results[key].n[cycle_index] > 0 for key in metric_keys):
+            continue
+        row: list[Any] = [cycle]
+        for key in metric_keys:
+            result = results[key]
+            row.extend(
+                [
+                    None if not math.isfinite(result.mean[cycle_index]) else result.mean[cycle_index],
+                    None if not math.isfinite(result.sd[cycle_index]) else result.sd[cycle_index],
+                    None if not math.isfinite(result.sem[cycle_index]) else result.sem[cycle_index],
+                    int(result.n[cycle_index]),
+                    *[
+                        None if not math.isfinite(value) else value
+                        for value in result.values[:, cycle_index]
+                    ],
+                ]
+            )
+        yield row
+
+
+def export_cycle_statistics(
+    datasets: Sequence[LandDataset],
+    metric_keys: Sequence[str],
+    output_path: str | Path,
+    cycle_start: int = 1,
+    cycle_end: int = 20,
+    progress: Callable[[str], None] | None = None,
+) -> None:
+    """Export Origin-ready mean/SD/SEM/n plus every battery's source values."""
+    if len(datasets) < 1:
+        raise ValueError("没有可用于统计的文件。")
+    cycle_metric_keys = [key for key in metric_keys if METRIC_BY_KEY[key].source == "cycle"]
+    if not cycle_metric_keys:
+        raise ValueError("多电池统计至少需要一个循环汇总指标。")
+    if cycle_start < 1 or cycle_end < cycle_start:
+        raise ValueError("统计起始圈不能大于结束圈。")
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    headers = statistics_wide_headers(datasets, cycle_metric_keys)
+    rows = list(iter_statistics_wide_rows(datasets, cycle_metric_keys, cycle_start, cycle_end))
+    if progress:
+        progress(f"正在统计 {len(datasets)} 个电池的第 {cycle_start}–{cycle_end} 圈")
+
+    if output.suffix.lower() == ".csv":
+        with output.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(headers)
+            writer.writerows(rows)
+        return
+    if output.suffix.lower() != ".xlsx":
+        raise ValueError("统计数据导出仅支持 .csv 或 .xlsx。")
+
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+    except ImportError as exc:
+        raise RuntimeError("导出 xlsx 需要 openpyxl；可改选 CSV，或安装 openpyxl。") from exc
+
+    workbook = Workbook()
+    wide_sheet = workbook.active
+    wide_sheet.title = "Origin Statistics"
+    wide_sheet.append(headers)
+    for row in rows:
+        wide_sheet.append(row)
+    wide_sheet.freeze_panes = "A2"
+
+    long_sheet = workbook.create_sheet("Long Statistics")
+    long_headers = ["Cycle", "Metric", "Unit", "Mean", "SD", "SEM", "n"]
+    long_sheet.append(long_headers)
+    for key in cycle_metric_keys:
+        metric = METRIC_BY_KEY[key]
+        result = compute_cycle_statistics(datasets, key, cycle_start, cycle_end)
+        for index, cycle in enumerate(result.cycles):
+            if result.n[index] == 0:
+                continue
+            long_sheet.append(
+                [
+                    int(cycle),
+                    metric.label,
+                    metric.unit,
+                    float(result.mean[index]),
+                    float(result.sd[index]),
+                    float(result.sem[index]),
+                    int(result.n[index]),
+                ]
+            )
+    long_sheet.freeze_panes = "A2"
+
+    info_sheet = workbook.create_sheet("Files")
+    info_sheet.append(["Battery", "File", "Cycles", "Records", "Path"])
+    for index, dataset in enumerate(datasets, start=1):
+        info_sheet.append([index, dataset.path.name, dataset.cycle_count, len(dataset.records), str(dataset.path)])
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+    for sheet in (wide_sheet, long_sheet, info_sheet):
+        for cell in sheet[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        sheet.auto_filter.ref = sheet.dimensions
+    workbook.save(output)
+
+
 class BITMAPINFOHEADER(ctypes.Structure):
     _fields_ = [
         ("biSize", ctypes.c_uint32),
@@ -1013,6 +1200,10 @@ class PlotOptions:
     time_unit: Literal["s", "min", "h"] = "h"
     cycle_start: int = 1
     cycle_end: int = 5
+    plot_mode: Literal["time", "statistics", "stack"] = "time"
+    error_bar: Literal["sd", "sem", "none"] = "sd"
+    show_individual_cells: bool = True
+    show_stack_mean: bool = True
     show_bottom_time: bool = True
     show_top_cycle: bool = True
     show_grid: bool = True
@@ -1215,6 +1406,195 @@ def draw_plot(
     return axes
 
 
+def _empty_plot_message(figure: Figure, message: str) -> list[Any]:
+    figure.clear()
+    axis = figure.add_subplot(111)
+    axis.set_facecolor("#FFFFFF")
+    figure.patch.set_facecolor("#F8FAFC")
+    axis.text(0.5, 0.5, message, ha="center", va="center", transform=axis.transAxes, fontsize=13, color="#64748B")
+    axis.set_xticks([])
+    axis.set_yticks([])
+    return [axis]
+
+
+def _cycle_metric_keys(metric_keys: Sequence[str]) -> list[str]:
+    return [key for key in metric_keys if METRIC_BY_KEY[key].source == "cycle"]
+
+
+def draw_cycle_statistics_plot(
+    figure: Figure,
+    datasets: Sequence[LandDataset],
+    metric_keys: Sequence[str],
+    styles: dict[str, CurveStyle],
+    options: PlotOptions,
+) -> list[Any]:
+    """Draw cycle-aligned mean lines with SD/SEM error bars across batteries."""
+    cycle_keys = _cycle_metric_keys(metric_keys)
+    if not datasets or not cycle_keys:
+        return _empty_plot_message(figure, "多电池统计需要导入文件并添加至少一个循环汇总指标")
+
+    figure.clear()
+    figure.patch.set_facecolor("#F8FAFC")
+    axes_array = figure.subplots(len(cycle_keys), 1, sharex=True, squeeze=False)
+    axes = [axes_array[index, 0] for index in range(len(cycle_keys))]
+    error_labels = {"sd": "SD", "sem": "SEM", "none": "无误差棒"}
+
+    for metric_index, (axis, key) in enumerate(zip(axes, cycle_keys)):
+        metric = METRIC_BY_KEY[key]
+        style = styles[key]
+        result = compute_cycle_statistics(datasets, key, options.cycle_start, options.cycle_end)
+        valid = result.n > 0
+        axis.set_facecolor("#FFFFFF")
+
+        if options.show_individual_cells:
+            for dataset_index, dataset in enumerate(datasets):
+                cell_values = result.values[dataset_index]
+                cell_valid = np.isfinite(cell_values)
+                if np.any(cell_valid):
+                    axis.plot(
+                        result.cycles[cell_valid],
+                        cell_values[cell_valid],
+                        color=style.color,
+                        linewidth=max(0.7, style.line_width * 0.65),
+                        alpha=0.20,
+                        marker="o" if len(result.cycles[cell_valid]) <= 30 else None,
+                        markersize=max(1.5, style.marker_size * 0.55),
+                        label="单个电池" if dataset_index == 0 else "_nolegend_",
+                    )
+
+        if np.any(valid):
+            y_error: np.ndarray | None
+            if options.error_bar == "sd":
+                y_error = result.sd[valid]
+            elif options.error_bar == "sem":
+                y_error = result.sem[valid]
+            else:
+                y_error = None
+            marker = "o" if style.plot_type in ("point", "line+point") else None
+            linestyle = "None" if style.plot_type == "point" else "-"
+            axis.errorbar(
+                result.cycles[valid],
+                result.mean[valid],
+                yerr=y_error,
+                color=style.color,
+                ecolor=style.color,
+                elinewidth=max(0.8, style.line_width * 0.8),
+                capsize=3 if y_error is not None else 0,
+                capthick=1.0,
+                linewidth=max(1.5, style.line_width),
+                linestyle=linestyle,
+                marker=marker or "o",
+                markersize=max(3.0, style.marker_size),
+                label=f"Mean ± {error_labels[options.error_bar]}" if y_error is not None else "Mean",
+                zorder=5,
+            )
+            positive_n = result.n[valid]
+            n_text = f"n={int(positive_n[0])}" if np.all(positive_n == positive_n[0]) else f"n={int(np.min(positive_n))}–{int(np.max(positive_n))}"
+            axis.text(0.99, 0.96, n_text, transform=axis.transAxes, ha="right", va="top", fontsize=8, color="#64748B")
+        else:
+            axis.text(0.5, 0.5, "该范围没有可用数据", ha="center", va="center", transform=axis.transAxes, color="#64748B")
+
+        axis.set_ylabel(metric.display, color=style.color, fontsize=9)
+        axis.tick_params(axis="y", labelsize=8, colors=style.color)
+        axis.grid(options.show_grid, color="#CBD5E1", linewidth=0.6, alpha=0.65)
+        axis.spines["top"].set_visible(False)
+        axis.spines["right"].set_visible(False)
+        if options.show_legend:
+            axis.legend(loc="best", fontsize=7, framealpha=0.9)
+        if metric_index < len(axes) - 1:
+            axis.tick_params(axis="x", labelbottom=False)
+
+    axes[-1].set_xlabel("Cycle", fontsize=10)
+    axes[-1].set_xlim(options.cycle_start - 0.4, options.cycle_end + 0.4)
+    axes[-1].xaxis.set_major_locator(MaxNLocator(integer=True, nbins=min(12, max(4, options.cycle_end - options.cycle_start + 1))))
+    figure.suptitle(options.title or "Multi-battery statistics", fontsize=13, fontweight="bold", color="#0F172A", y=0.985)
+    figure.subplots_adjust(left=0.13, right=0.96, top=0.92, bottom=0.10, hspace=0.14)
+    return axes
+
+
+def draw_cycle_stack_plot(
+    figure: Figure,
+    datasets: Sequence[LandDataset],
+    metric_keys: Sequence[str],
+    styles: dict[str, CurveStyle],
+    options: PlotOptions,
+) -> list[Any]:
+    """Draw one vertically stacked panel per metric, with one line per battery."""
+    cycle_keys = _cycle_metric_keys(metric_keys)
+    if not datasets or not cycle_keys:
+        return _empty_plot_message(figure, "Stack 图需要导入文件并添加至少一个循环汇总指标")
+
+    figure.clear()
+    figure.patch.set_facecolor("#F8FAFC")
+    axes_array = figure.subplots(len(cycle_keys), 1, sharex=True, squeeze=False)
+    axes = [axes_array[index, 0] for index in range(len(cycle_keys))]
+    color_map = matplotlib.colormaps.get_cmap("tab20")
+
+    for metric_index, (axis, key) in enumerate(zip(axes, cycle_keys)):
+        metric = METRIC_BY_KEY[key]
+        axis.set_facecolor("#FFFFFF")
+        result = compute_cycle_statistics(datasets, key, options.cycle_start, options.cycle_end)
+        for dataset_index, dataset in enumerate(datasets):
+            values = result.values[dataset_index]
+            valid = np.isfinite(values)
+            if not np.any(valid):
+                continue
+            axis.plot(
+                result.cycles[valid],
+                values[valid],
+                color=color_map(dataset_index % color_map.N),
+                linewidth=max(0.9, styles[key].line_width * 0.8),
+                marker="o" if len(result.cycles[valid]) <= 30 else None,
+                markersize=max(2.0, styles[key].marker_size * 0.7),
+                alpha=0.82,
+                label=dataset.name,
+            )
+        if options.show_stack_mean:
+            valid_mean = result.n > 0
+            if np.any(valid_mean):
+                axis.plot(
+                    result.cycles[valid_mean],
+                    result.mean[valid_mean],
+                    color="#111827",
+                    linewidth=max(2.0, styles[key].line_width * 1.35),
+                    linestyle="--",
+                    label="Mean",
+                    zorder=6,
+                )
+        axis.set_ylabel(metric.display, fontsize=9, color=styles[key].color)
+        axis.tick_params(axis="y", labelsize=8)
+        axis.grid(options.show_grid, color="#CBD5E1", linewidth=0.6, alpha=0.65)
+        axis.spines["top"].set_visible(False)
+        axis.spines["right"].set_visible(False)
+        if options.show_legend:
+            columns = min(4, max(1, math.ceil((len(datasets) + int(options.show_stack_mean)) / 2)))
+            axis.legend(loc="upper right", fontsize=6.8, ncol=columns, framealpha=0.88)
+        if metric_index < len(axes) - 1:
+            axis.tick_params(axis="x", labelbottom=False)
+
+    axes[-1].set_xlabel("Cycle", fontsize=10)
+    axes[-1].set_xlim(options.cycle_start - 0.4, options.cycle_end + 0.4)
+    axes[-1].xaxis.set_major_locator(MaxNLocator(integer=True, nbins=min(12, max(4, options.cycle_end - options.cycle_start + 1))))
+    figure.suptitle(options.title or "Multi-battery stack plot", fontsize=13, fontweight="bold", color="#0F172A", y=0.99)
+    figure.subplots_adjust(left=0.13, right=0.96, top=0.90, bottom=0.10, hspace=0.14)
+    return axes
+
+
+def draw_selected_plot(
+    figure: Figure,
+    datasets: Sequence[LandDataset],
+    metric_keys: Sequence[str],
+    styles: dict[str, CurveStyle],
+    options: PlotOptions,
+    primary_dataset: LandDataset | None = None,
+) -> list[Any]:
+    if options.plot_mode == "statistics":
+        return draw_cycle_statistics_plot(figure, datasets, metric_keys, styles, options)
+    if options.plot_mode == "stack":
+        return draw_cycle_stack_plot(figure, datasets, metric_keys, styles, options)
+    return draw_plot(figure, datasets, metric_keys, styles, options, primary_dataset)
+
+
 class CollapsibleFrame(ttk.Frame):
     def __init__(self, master: tk.Misc, title: str, initially_open: bool = True, **kwargs: Any) -> None:
         super().__init__(master, **kwargs)
@@ -1266,7 +1646,12 @@ class ScrollableFrame(ttk.Frame):
 class AddMetricDialog(tk.Toplevel):
     """Compact + dialog for adding one or more metrics to the plot area."""
 
-    def __init__(self, master: tk.Misc, existing_keys: Sequence[str]) -> None:
+    def __init__(
+        self,
+        master: tk.Misc,
+        existing_keys: Sequence[str],
+        source_filter: Literal["record", "cycle"] | None = None,
+    ) -> None:
         super().__init__(master)
         self.title("＋ 添加绘图数据")
         self.geometry("520x570")
@@ -1278,7 +1663,8 @@ class AddMetricDialog(tk.Toplevel):
 
         frame = ttk.Frame(self, padding=16, style="Panel.TFrame")
         frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="选择要加入绘图区的数据", style="Section.TLabel").pack(anchor="w")
+        heading = "选择循环汇总指标" if source_filter == "cycle" else "选择要加入绘图区的数据"
+        ttk.Label(frame, text=heading, style="Section.TLabel").pack(anchor="w")
         ttk.Label(
             frame,
             text="可按 Ctrl / Shift 多选；双击一个指标也可直接添加。",
@@ -1305,6 +1691,8 @@ class AddMetricDialog(tk.Toplevel):
 
         categories: dict[str, list[MetricDef]] = {}
         for metric in METRICS:
+            if source_filter is not None and metric.source != source_filter:
+                continue
             categories.setdefault(metric.category, []).append(metric)
         for category, metrics in categories.items():
             parent_id = f"category::{category}"
@@ -1330,14 +1718,20 @@ class AddMetricDialog(tk.Toplevel):
 
 
 class DataExportDialog(tk.Toplevel):
-    def __init__(self, master: tk.Misc, cycle_start: int = 1, cycle_end: int = 5) -> None:
+    def __init__(
+        self,
+        master: tk.Misc,
+        cycle_start: int = 1,
+        cycle_end: int = 5,
+        default_layout: Literal["wide", "long", "statistics"] = "wide",
+    ) -> None:
         super().__init__(master)
         self.title("导出整理后的数据")
         self.resizable(False, False)
         self.transient(master)
         self.grab_set()
         self.result: dict[str, Any] | None = None
-        self.layout_var = tk.StringVar(value="wide")
+        self.layout_var = tk.StringVar(value=default_layout)
         self.scope_var = tk.StringVar(value="selected")
         self.cycle_start_var = tk.IntVar(value=cycle_start)
         self.cycle_end_var = tk.IntVar(value=cycle_end)
@@ -1356,6 +1750,12 @@ class DataExportDialog(tk.Toplevel):
             text="长表：第 4 列为 Value，后接 Metric 和 Unit",
             variable=self.layout_var,
             value="long",
+        ).pack(anchor="w", pady=2)
+        ttk.Radiobutton(
+            frame,
+            text="多电池统计表：Mean、SD、SEM、n 与各电池数据（Origin）",
+            variable=self.layout_var,
+            value="statistics",
         ).pack(anchor="w", pady=2)
 
         ttk.Separator(frame).pack(fill="x", pady=14)
@@ -1434,6 +1834,10 @@ class LandtWorkbenchApp(tk.Tk):
         self.plot_range_hint_var = tk.StringVar(value="默认只绘制第 1–5 圈")
         self.plot_cycle_start_var = tk.IntVar(value=1)
         self.plot_cycle_end_var = tk.IntVar(value=5)
+        self.plot_mode_var = tk.StringVar(value="原始时序图")
+        self.error_bar_var = tk.StringVar(value="标准差 SD")
+        self.show_individual_cells_var = tk.BooleanVar(value=True)
+        self.show_stack_mean_var = tk.BooleanVar(value=True)
         self.title_var = tk.StringVar(value="LAND electrochemical data")
         self.time_unit_var = tk.StringVar(value="h")
         self.show_bottom_var = tk.BooleanVar(value=True)
@@ -1452,6 +1856,7 @@ class LandtWorkbenchApp(tk.Tk):
         self.marker_size_var = tk.DoubleVar(value=3.5)
 
         self._build_ui()
+        self._sync_plot_mode_controls()
         self._refresh_curve_list()
         self._refresh_style_metric_choices()
         self.after(100, self._poll_ui_queue)
@@ -1588,6 +1993,15 @@ class LandtWorkbenchApp(tk.Tk):
 
         range_card = ttk.Frame(container, style="Card.TFrame", padding=10)
         range_card.pack(fill="x", padx=8, pady=3)
+        ttk.Label(range_card, text="绘图模式", style="CardSection.TLabel").pack(anchor="w")
+        mode_combo = ttk.Combobox(
+            range_card,
+            textvariable=self.plot_mode_var,
+            values=tuple(PLOT_MODE_LABELS),
+            state="readonly",
+        )
+        mode_combo.pack(fill="x", pady=(6, 9))
+        mode_combo.bind("<<ComboboxSelected>>", self._on_plot_mode_changed)
         ttk.Label(range_card, text="圈数范围", style="CardSection.TLabel").pack(anchor="w")
         range_row = ttk.Frame(range_card, style="Card.TFrame")
         range_row.pack(fill="x", pady=(8, 4))
@@ -1607,13 +2021,38 @@ class LandtWorkbenchApp(tk.Tk):
             textvariable=self.plot_cycle_end_var,
             width=8,
         ).pack(side="left", padx=6)
-        ttk.Button(range_row, text="1–5", command=self._reset_plot_range, width=5).pack(side="right")
+        ttk.Button(range_row, text="默认", command=self._reset_plot_range, width=5).pack(side="right")
         ttk.Label(
             range_card,
             textvariable=self.plot_range_hint_var,
             style="CardHint.TLabel",
             wraplength=300,
         ).pack(anchor="w", pady=(3, 0))
+        self.multi_battery_options = ttk.Frame(range_card, style="Card.TFrame")
+        ttk.Separator(self.multi_battery_options).pack(fill="x", pady=(9, 7))
+        error_row = ttk.Frame(self.multi_battery_options, style="Card.TFrame")
+        error_row.pack(fill="x")
+        ttk.Label(error_row, text="误差棒", style="CardHint.TLabel").pack(side="left")
+        self.error_bar_combo = ttk.Combobox(
+            error_row,
+            textvariable=self.error_bar_var,
+            values=tuple(ERROR_BAR_LABELS),
+            state="readonly",
+            width=11,
+        )
+        self.error_bar_combo.pack(side="right")
+        self.individual_cells_check = ttk.Checkbutton(
+            self.multi_battery_options,
+            text="统计图中显示各电池浅色曲线",
+            variable=self.show_individual_cells_var,
+        )
+        self.individual_cells_check.pack(anchor="w", pady=(6, 1))
+        self.stack_mean_check = ttk.Checkbutton(
+            self.multi_battery_options,
+            text="Stack 图中叠加总体均值",
+            variable=self.show_stack_mean_var,
+        )
+        self.stack_mean_check.pack(anchor="w", pady=1)
 
         data_card = ttk.Frame(container, style="Card.TFrame", padding=10)
         data_card.pack(fill="x", padx=8, pady=5)
@@ -1646,6 +2085,7 @@ class LandtWorkbenchApp(tk.Tk):
         metric_buttons.pack(fill="x", pady=(8, 0))
         ttk.Button(metric_buttons, text="＋ 添加数据", command=self.add_plot_metrics).pack(side="left")
         ttk.Button(metric_buttons, text="－ 移除", command=self.remove_plot_metrics).pack(side="left", padx=(7, 0))
+        ttk.Button(metric_buttons, text="常用统计", command=self.add_common_statistics_metrics).pack(side="right")
 
         ttk.Button(
             container,
@@ -1798,7 +2238,10 @@ class LandtWorkbenchApp(tk.Tk):
         self.curve_count_var.set(f"已添加 {count} 项" if count else "尚未添加数据；点击 ＋ 开始")
 
     def add_plot_metrics(self) -> None:
-        dialog = AddMetricDialog(self, self.plot_metric_keys)
+        source_filter: Literal["cycle"] | None = None
+        if PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time") in {"statistics", "stack"}:
+            source_filter = "cycle"
+        dialog = AddMetricDialog(self, self.plot_metric_keys, source_filter=source_filter)
         self.wait_window(dialog)
         if not dialog.result:
             return
@@ -1806,6 +2249,17 @@ class LandtWorkbenchApp(tk.Tk):
         self._refresh_curve_list()
         self._refresh_style_metric_choices()
         self.status_var.set(f"已向绘图区添加 {len(dialog.result)} 项数据；点击“绘制所选范围”。")
+
+    def add_common_statistics_metrics(self) -> None:
+        common_keys = ["coulombic_efficiency_pct", "discharge_specific_capacity_mah_g"]
+        added = [key for key in common_keys if key not in self.plot_metric_keys]
+        self.plot_metric_keys.extend(added)
+        self._refresh_curve_list()
+        self._refresh_style_metric_choices()
+        if added:
+            self.status_var.set("已添加库伦效率和放电比容量；多电池统计模式默认绘制前 20 圈。")
+        else:
+            self.status_var.set("库伦效率和放电比容量已经在绘图区中。")
 
     def remove_plot_metrics(self) -> None:
         indices = list(self.curve_listbox.curselection())
@@ -1827,12 +2281,54 @@ class LandtWorkbenchApp(tk.Tk):
 
     def _reset_plot_range(self) -> None:
         self.plot_cycle_start_var.set(1)
-        self.plot_cycle_end_var.set(5)
+        mode = PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time")
+        self.plot_cycle_end_var.set(5 if mode == "time" else 20)
+
+    def _sync_plot_mode_controls(self) -> None:
+        mode = PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time")
+        if mode == "time":
+            self.multi_battery_options.pack_forget()
+            return
+        if not self.multi_battery_options.winfo_manager():
+            self.multi_battery_options.pack(fill="x")
+        if mode == "statistics":
+            self.error_bar_combo.configure(state="readonly")
+            self.individual_cells_check.configure(state="normal")
+            self.stack_mean_check.configure(state="disabled")
+        else:
+            self.error_bar_combo.configure(state="disabled")
+            self.individual_cells_check.configure(state="disabled")
+            self.stack_mean_check.configure(state="normal")
+
+    def _on_plot_mode_changed(self, _event: tk.Event | None = None) -> None:
+        mode = PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time")
+        try:
+            current_start = int(self.plot_cycle_start_var.get())
+            current_end = int(self.plot_cycle_end_var.get())
+        except (tk.TclError, ValueError):
+            current_start, current_end = 1, 5
+        if mode in {"statistics", "stack"} and current_start == 1 and current_end <= 5:
+            self.plot_cycle_end_var.set(20)
+        default_titles = {
+            "time": "LAND electrochemical data",
+            "statistics": "Multi-battery statistics",
+            "stack": "Multi-battery stack plot",
+        }
+        if self.title_var.get() in set(default_titles.values()):
+            self.title_var.set(default_titles[mode])
+        self._sync_plot_mode_controls()
+        if mode in {"statistics", "stack"}:
+            non_cycle_count = sum(METRIC_BY_KEY[key].source != "cycle" for key in self.plot_metric_keys)
+            suffix = f"；当前 {non_cycle_count} 个逐时刻指标将在该模式中忽略" if non_cycle_count else ""
+            self.status_var.set(f"多电池模式默认统计前 20 圈，点击 ＋ 可添加库伦效率、放电比容量等指标{suffix}。")
+        else:
+            self.status_var.set("已切换为原始时序图。")
 
     def _update_range_hint(self) -> None:
         dataset = self.primary_dataset()
         if not dataset or not dataset.cycles:
-            self.plot_range_hint_var.set("默认只绘制第 1–5 圈")
+            mode = PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time")
+            self.plot_range_hint_var.set("默认统计第 1–20 圈" if mode != "time" else "默认只绘制第 1–5 圈")
             return
         cycles = sorted(dataset.cycles)
         self.plot_range_hint_var.set(f"当前参考文件：第 {cycles[0]}–{cycles[-1]} 圈，共 {len(cycles)} 圈")
@@ -1984,6 +2480,10 @@ class LandtWorkbenchApp(tk.Tk):
             time_unit=self.time_unit_var.get(),  # type: ignore[arg-type]
             cycle_start=cycle_start,
             cycle_end=cycle_end,
+            plot_mode=PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time"),  # type: ignore[arg-type]
+            error_bar=ERROR_BAR_LABELS.get(self.error_bar_var.get(), "sd"),  # type: ignore[arg-type]
+            show_individual_cells=self.show_individual_cells_var.get(),
+            show_stack_mean=self.show_stack_mean_var.get(),
             show_bottom_time=self.show_bottom_var.get(),
             show_top_cycle=self.show_top_var.get(),
             show_grid=self.show_grid_var.get(),
@@ -1996,22 +2496,28 @@ class LandtWorkbenchApp(tk.Tk):
             self._apply_style_form(redraw=False)
             datasets = self.enabled_datasets()
             metrics = self.selected_metric_keys()
-            if len(metrics) > 8:
+            options = self.current_plot_options()
+            if options.plot_mode == "time" and len(metrics) > 8:
                 self.status_var.set("提示：当前绘制超过 8 个 Y 轴，图面可能较拥挤。")
-            draw_plot(
+            draw_selected_plot(
                 self.figure,
                 datasets,
                 metrics,
                 self.curve_styles,
-                self.current_plot_options(),
+                options,
                 self.primary_dataset(),
             )
             self.canvas.draw_idle()
             if datasets and metrics:
-                options = self.current_plot_options()
+                mode_text = {
+                    "time": "原始时序图",
+                    "statistics": "多电池均值＋误差棒",
+                    "stack": "多电池 Stack 分层图",
+                }[options.plot_mode]
+                visible_metrics = _cycle_metric_keys(metrics) if options.plot_mode != "time" else metrics
                 self.status_var.set(
-                    f"已绘制第 {options.cycle_start}–{options.cycle_end} 圈 · "
-                    f"{len(datasets)} 个文件 × {len(metrics)} 个指标"
+                    f"{mode_text} · 第 {options.cycle_start}–{options.cycle_end} 圈 · "
+                    f"{len(datasets)} 个电池 × {len(visible_metrics)} 个指标"
                 )
         except Exception as exc:
             self.status_var.set(f"绘图失败：{exc}")
@@ -2027,35 +2533,54 @@ class LandtWorkbenchApp(tk.Tk):
             default_end = int(self.plot_cycle_end_var.get())
         except (tk.TclError, ValueError):
             default_start, default_end = 1, 5
-        dialog = DataExportDialog(self, default_start, default_end)
+        default_layout: Literal["wide", "statistics"] = (
+            "statistics" if PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time") != "time" else "wide"
+        )
+        dialog = DataExportDialog(self, default_start, default_end, default_layout=default_layout)
         self.wait_window(dialog)
         if not dialog.result:
             return
         metric_keys = self.selected_metric_keys() if dialog.result["scope"] == "selected" else [metric.key for metric in METRICS]
+        if dialog.result["layout"] == "statistics":
+            metric_keys = _cycle_metric_keys(metric_keys)
         if not metric_keys:
-            messagebox.showwarning(APP_NAME, "当前绘图区没有数据，请先点击 ＋ 添加，或选择“导出全部可用指标”。", parent=self)
+            messagebox.showwarning(
+                APP_NAME,
+                "当前选择中没有可导出的指标。多电池统计表需要库伦效率、放电比容量等循环汇总指标。",
+                parent=self,
+            )
             return
         output = filedialog.asksaveasfilename(
             parent=self,
             title="保存整理后的数据",
             defaultextension=".xlsx",
             filetypes=(("Excel workbook", "*.xlsx"), ("CSV", "*.csv")),
-            initialfile="LAND整理数据.xlsx",
+            initialfile="LAND多电池统计.xlsx" if dialog.result["layout"] == "statistics" else "LAND整理数据.xlsx",
         )
         if not output:
             return
         self._set_busy(True, "正在后台导出数据…")
 
         def run_export() -> str:
-            export_selected_data(
-                datasets,
-                metric_keys,
-                output,
-                layout=dialog.result["layout"],  # type: ignore[arg-type]
-                cycle_start=dialog.result["cycle_start"],
-                cycle_end=dialog.result["cycle_end"],
-                progress=lambda text: self.ui_queue.put(("status", text)),
-            )
+            if dialog.result["layout"] == "statistics":
+                export_cycle_statistics(
+                    datasets,
+                    metric_keys,
+                    output,
+                    cycle_start=dialog.result["cycle_start"],
+                    cycle_end=dialog.result["cycle_end"],
+                    progress=lambda text: self.ui_queue.put(("status", text)),
+                )
+            else:
+                export_selected_data(
+                    datasets,
+                    metric_keys,
+                    output,
+                    layout=dialog.result["layout"],  # type: ignore[arg-type]
+                    cycle_start=dialog.result["cycle_start"],
+                    cycle_end=dialog.result["cycle_end"],
+                    progress=lambda text: self.ui_queue.put(("status", text)),
+                )
             return output
 
         future = self.executor.submit(run_export)
@@ -2166,6 +2691,42 @@ def run_self_test(source_dir: str | Path, output_dir: str | Path) -> int:
         layout="wide",
         cycle_start=1,
         cycle_end=5,
+    )
+
+    statistics_keys = ["coulombic_efficiency_pct", "discharge_capacity_mah"]
+    statistics = compute_cycle_statistics(subsets, statistics_keys[0], 1, 20)
+    if not np.any(statistics.n > 0):
+        raise AssertionError("多电池统计结果为空。")
+    statistics_figure = Figure(figsize=(10, 7), dpi=110)
+    draw_cycle_statistics_plot(
+        statistics_figure,
+        subsets,
+        statistics_keys,
+        styles,
+        PlotOptions(
+            title="LAND multi-battery statistics self-test",
+            cycle_start=1,
+            cycle_end=20,
+            plot_mode="statistics",
+            error_bar="sd",
+        ),
+    )
+    save_figure(statistics_figure, output / "self_test_statistics.png", dpi=160)
+    stack_figure = Figure(figsize=(10, 7), dpi=110)
+    draw_cycle_stack_plot(
+        stack_figure,
+        subsets,
+        statistics_keys,
+        styles,
+        PlotOptions(title="LAND stack self-test", cycle_start=1, cycle_end=20, plot_mode="stack"),
+    )
+    save_figure(stack_figure, output / "self_test_stack.png", dpi=160)
+    export_cycle_statistics(
+        subsets,
+        statistics_keys,
+        output / "self_test_statistics.xlsx",
+        cycle_start=1,
+        cycle_end=20,
     )
     export_selected_data(
         subsets,
