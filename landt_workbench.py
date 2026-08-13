@@ -51,12 +51,12 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 
 
 APP_NAME = "蓝电数据工作台"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 PLOT_MODE_LABELS = {
     "原始时序图": "time",
     "多电池均值＋误差棒": "statistics",
-    "多电池 Stack 分层图": "stack",
+    "多电池原始曲线 Stack": "stack",
 }
 ERROR_BAR_LABELS = {"标准差 SD": "sd", "标准误 SEM": "sem", "不显示": "none"}
 
@@ -1203,7 +1203,6 @@ class PlotOptions:
     plot_mode: Literal["time", "statistics", "stack"] = "time"
     error_bar: Literal["sd", "sem", "none"] = "sd"
     show_individual_cells: bool = True
-    show_stack_mean: bool = True
     show_bottom_time: bool = True
     show_top_cycle: bool = True
     show_grid: bool = True
@@ -1421,6 +1420,10 @@ def _cycle_metric_keys(metric_keys: Sequence[str]) -> list[str]:
     return [key for key in metric_keys if METRIC_BY_KEY[key].source == "cycle"]
 
 
+def _record_metric_keys(metric_keys: Sequence[str]) -> list[str]:
+    return [key for key in metric_keys if METRIC_BY_KEY[key].source == "record"]
+
+
 def draw_cycle_statistics_plot(
     figure: Figure,
     datasets: Sequence[LandDataset],
@@ -1512,72 +1515,165 @@ def draw_cycle_statistics_plot(
     return axes
 
 
-def draw_cycle_stack_plot(
+def draw_record_stack_plot(
     figure: Figure,
     datasets: Sequence[LandDataset],
     metric_keys: Sequence[str],
     styles: dict[str, CurveStyle],
     options: PlotOptions,
 ) -> list[Any]:
-    """Draw one vertically stacked panel per metric, with one line per battery."""
-    cycle_keys = _cycle_metric_keys(metric_keys)
-    if not datasets or not cycle_keys:
-        return _empty_plot_message(figure, "Stack 图需要导入文件并添加至少一个循环汇总指标")
+    """Stack one raw time-series panel per battery for direct cell-to-cell comparison."""
+    record_keys = _record_metric_keys(metric_keys)
+    if not datasets or not record_keys:
+        return _empty_plot_message(figure, "Stack 图需要导入文件并添加电压、电流等逐时刻指标")
 
     figure.clear()
     figure.patch.set_facecolor("#F8FAFC")
-    axes_array = figure.subplots(len(cycle_keys), 1, sharex=True, squeeze=False)
-    axes = [axes_array[index, 0] for index in range(len(cycle_keys))]
-    color_map = matplotlib.colormaps.get_cmap("tab20")
+    base_array = figure.subplots(len(datasets), 1, sharex=True, squeeze=False)
+    base_axes = [base_array[index, 0] for index in range(len(datasets))]
+    all_axes: list[Any] = []
+    metric_axes: dict[str, list[Any]] = {key: [] for key in record_keys}
+    y_bounds: dict[str, list[float]] = {key: [math.inf, -math.inf] for key in record_keys}
+    layout = resolved_axis_layout(record_keys, styles)
+    time_factor, time_label = time_factor_and_label(options.time_unit)
+    max_x = 0.0
 
-    for metric_index, (axis, key) in enumerate(zip(axes, cycle_keys)):
-        metric = METRIC_BY_KEY[key]
-        axis.set_facecolor("#FFFFFF")
-        result = compute_cycle_statistics(datasets, key, options.cycle_start, options.cycle_end)
-        for dataset_index, dataset in enumerate(datasets):
-            values = result.values[dataset_index]
-            valid = np.isfinite(values)
+    for dataset_index, (base, dataset) in enumerate(zip(base_axes, datasets)):
+        base.set_facecolor("#FFFFFF")
+        selected_times = [
+            row.elapsed_s
+            for row in dataset.records
+            if options.cycle_start <= row.cycle <= options.cycle_end
+        ]
+        if not selected_times:
+            base.text(0.5, 0.5, "所选圈数没有逐时刻数据", ha="center", va="center", transform=base.transAxes, color="#64748B")
+            base.set_ylabel(dataset.name, fontsize=8, color="#334155")
+            all_axes.append(base)
+            continue
+        range_start_s = min(selected_times)
+
+        panel_handles: list[Any] = []
+        panel_labels: list[str] = []
+        for metric_index, key in enumerate(record_keys):
+            metric = METRIC_BY_KEY[key]
+            style = styles[key]
+            axis = base if metric_index == 0 else base.twinx()
+            all_axes.append(axis)
+            metric_axes[key].append(axis)
+            side, offset = layout[key]
+            if side == "left":
+                axis.yaxis.set_label_position("left")
+                axis.yaxis.tick_left()
+                axis.spines["left"].set_position(("outward", offset))
+                axis.spines["left"].set_visible(style.axis_visible)
+                axis.spines["right"].set_visible(False)
+            else:
+                axis.yaxis.set_label_position("right")
+                axis.yaxis.tick_right()
+                axis.spines["right"].set_position(("outward", offset))
+                axis.spines["right"].set_visible(style.axis_visible)
+                axis.spines["left"].set_visible(False)
+            axis.spines["top"].set_visible(False)
+            if style.axis_visible:
+                axis.set_ylabel(metric.display, color=style.color, fontsize=8, labelpad=6)
+                axis.tick_params(axis="y", colors=style.color, labelsize=7)
+            else:
+                axis.set_ylabel("")
+                axis.tick_params(axis="y", left=False, right=False, labelleft=False, labelright=False)
+
+            x_values, y_values = dataset.series(key, options.cycle_start, options.cycle_end)
+            if len(x_values) == 0:
+                continue
+            x_values = (x_values - range_start_s) / time_factor
+            x_values, y_values = minmax_decimate(x_values, y_values, options.max_points_per_curve)
+            valid = np.isfinite(x_values) & np.isfinite(y_values)
             if not np.any(valid):
                 continue
-            axis.plot(
-                result.cycles[valid],
-                values[valid],
-                color=color_map(dataset_index % color_map.N),
-                linewidth=max(0.9, styles[key].line_width * 0.8),
-                marker="o" if len(result.cycles[valid]) <= 30 else None,
-                markersize=max(2.0, styles[key].marker_size * 0.7),
-                alpha=0.82,
-                label=dataset.name,
+            x_values = x_values[valid]
+            y_values = y_values[valid]
+            max_x = max(max_x, float(np.nanmax(x_values)))
+            y_bounds[key][0] = min(y_bounds[key][0], float(np.nanmin(y_values)))
+            y_bounds[key][1] = max(y_bounds[key][1], float(np.nanmax(y_values)))
+            marker = "o" if style.plot_type in ("point", "line+point") else None
+            linestyle = "None" if style.plot_type == "point" else "-"
+            line, = axis.plot(
+                x_values,
+                y_values,
+                color=style.color,
+                linestyle=linestyle,
+                marker=marker,
+                markersize=style.marker_size,
+                linewidth=style.line_width,
+                alpha=0.92,
+                label=metric.display,
             )
-        if options.show_stack_mean:
-            valid_mean = result.n > 0
-            if np.any(valid_mean):
-                axis.plot(
-                    result.cycles[valid_mean],
-                    result.mean[valid_mean],
-                    color="#111827",
-                    linewidth=max(2.0, styles[key].line_width * 1.35),
-                    linestyle="--",
-                    label="Mean",
-                    zorder=6,
-                )
-        axis.set_ylabel(metric.display, fontsize=9, color=styles[key].color)
-        axis.tick_params(axis="y", labelsize=8)
-        axis.grid(options.show_grid, color="#CBD5E1", linewidth=0.6, alpha=0.65)
-        axis.spines["top"].set_visible(False)
-        axis.spines["right"].set_visible(False)
-        if options.show_legend:
-            columns = min(4, max(1, math.ceil((len(datasets) + int(options.show_stack_mean)) / 2)))
-            axis.legend(loc="upper right", fontsize=6.8, ncol=columns, framealpha=0.88)
-        if metric_index < len(axes) - 1:
-            axis.tick_params(axis="x", labelbottom=False)
+            panel_handles.append(line)
+            panel_labels.append(metric.display)
 
-    axes[-1].set_xlabel("Cycle", fontsize=10)
-    axes[-1].set_xlim(options.cycle_start - 0.4, options.cycle_end + 0.4)
-    axes[-1].xaxis.set_major_locator(MaxNLocator(integer=True, nbins=min(12, max(4, options.cycle_end - options.cycle_start + 1))))
-    figure.suptitle(options.title or "Multi-battery stack plot", fontsize=13, fontweight="bold", color="#0F172A", y=0.99)
-    figure.subplots_adjust(left=0.13, right=0.96, top=0.90, bottom=0.10, hspace=0.14)
-    return axes
+        base.text(
+            0.008,
+            0.96,
+            dataset.name,
+            transform=base.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8.5,
+            fontweight="bold",
+            color="#0F172A",
+            bbox={"boxstyle": "round,pad=0.22", "facecolor": "white", "edgecolor": "#CBD5E1", "alpha": 0.88},
+            zorder=10,
+        )
+        base.grid(options.show_grid, color="#CBD5E1", linewidth=0.55, alpha=0.60)
+        base.xaxis.set_major_locator(MaxNLocator(nbins=10, min_n_ticks=4))
+        if dataset_index < len(base_axes) - 1 or not options.show_bottom_time:
+            base.tick_params(axis="x", labelbottom=False, bottom=options.show_bottom_time)
+        else:
+            base.tick_params(axis="x", labelsize=8)
+
+        if options.show_top_cycle:
+            anchors, cycles = dataset.cycle_anchors(options.cycle_start, options.cycle_end)
+            if len(anchors):
+                anchors = (anchors - range_start_s) / time_factor
+                label_step = max(1, math.ceil(len(anchors) / 12))
+                for marker_index, (anchor, cycle) in enumerate(zip(anchors, cycles)):
+                    base.axvline(anchor, color="#94A3B8", linewidth=0.55, linestyle=":", alpha=0.65, zorder=0)
+                    if marker_index % label_step == 0 or marker_index == len(anchors) - 1:
+                        base.text(
+                            anchor,
+                            0.98,
+                            f"C{cycle}",
+                            transform=base.get_xaxis_transform(),
+                            ha="center",
+                            va="top",
+                            fontsize=6.8,
+                            color="#64748B",
+                        )
+        if options.show_legend and dataset_index == 0 and panel_handles:
+            base.legend(panel_handles, panel_labels, loc="lower right", fontsize=6.8, ncol=min(3, len(panel_handles)), framealpha=0.88)
+
+    for key, axes_for_metric in metric_axes.items():
+        low, high = y_bounds[key]
+        if not math.isfinite(low) or not math.isfinite(high):
+            continue
+        span = high - low
+        margin = span * 0.06 if span > 0 else max(abs(high) * 0.04, 0.05)
+        for axis in axes_for_metric:
+            axis.set_ylim(low - margin, high + margin)
+
+    x_margin = max_x * 0.015 if max_x > 0 else 1.0
+    base_axes[-1].set_xlim(-x_margin, max_x + x_margin)
+    base_axes[-1].set_xlabel(time_label if options.show_bottom_time else "", fontsize=10)
+    left_axes = sum(1 for key in record_keys if layout[key][0] == "left")
+    right_axes = len(record_keys) - left_axes
+    figure.suptitle(options.title or "Multi-battery raw-curve stack", fontsize=13, fontweight="bold", color="#0F172A", y=0.992)
+    figure.subplots_adjust(
+        left=min(0.42, 0.10 + max(0, left_axes - 1) * 0.065),
+        right=max(0.58, 0.97 - max(0, right_axes - 1) * 0.065),
+        top=0.94,
+        bottom=0.08,
+        hspace=0.12,
+    )
+    return all_axes
 
 
 def draw_selected_plot(
@@ -1591,7 +1687,7 @@ def draw_selected_plot(
     if options.plot_mode == "statistics":
         return draw_cycle_statistics_plot(figure, datasets, metric_keys, styles, options)
     if options.plot_mode == "stack":
-        return draw_cycle_stack_plot(figure, datasets, metric_keys, styles, options)
+        return draw_record_stack_plot(figure, datasets, metric_keys, styles, options)
     return draw_plot(figure, datasets, metric_keys, styles, options, primary_dataset)
 
 
@@ -1654,22 +1750,24 @@ class AddMetricDialog(tk.Toplevel):
     ) -> None:
         super().__init__(master)
         self.title("＋ 添加绘图数据")
-        self.geometry("520x570")
-        self.minsize(440, 430)
+        self.geometry("640x700")
+        self.minsize(540, 520)
         self.transient(master)
         self.grab_set()
         self.result: list[str] | None = None
         self.existing_keys = set(existing_keys)
 
-        frame = ttk.Frame(self, padding=16, style="Panel.TFrame")
+        frame = ttk.Frame(self, padding=22, style="Panel.TFrame")
         frame.pack(fill="both", expand=True)
         heading = "选择循环汇总指标" if source_filter == "cycle" else "选择要加入绘图区的数据"
         ttk.Label(frame, text=heading, style="Section.TLabel").pack(anchor="w")
         ttk.Label(
             frame,
-            text="可按 Ctrl / Shift 多选；双击一个指标也可直接添加。",
+            text="支持 Ctrl / Shift 多选；双击可立即添加。",
             style="Hint.TLabel",
-        ).pack(anchor="w", pady=(3, 9))
+            wraplength=570,
+            justify="left",
+        ).pack(anchor="w", pady=(6, 14))
 
         tree_frame = ttk.Frame(frame, style="Panel.TFrame")
         tree_frame.pack(fill="both", expand=True)
@@ -1680,12 +1778,13 @@ class AddMetricDialog(tk.Toplevel):
             show="tree headings",
             selectmode="extended",
             yscrollcommand=scrollbar.set,
+            style="Metric.Treeview",
         )
         scrollbar.configure(command=self.tree.yview)
         self.tree.heading("#0", text="数据")
         self.tree.heading("state", text="状态")
-        self.tree.column("#0", width=345, minwidth=240)
-        self.tree.column("state", width=90, anchor="center")
+        self.tree.column("#0", width=440, minwidth=300)
+        self.tree.column("state", width=105, anchor="center")
         self.tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
@@ -1696,14 +1795,15 @@ class AddMetricDialog(tk.Toplevel):
             categories.setdefault(metric.category, []).append(metric)
         for category, metrics in categories.items():
             parent_id = f"category::{category}"
-            self.tree.insert("", "end", iid=parent_id, text=category, values=("",), open=True)
+            self.tree.insert("", "end", iid=parent_id, text=category, values=("",), open=True, tags=("category",))
             for metric in metrics:
                 state = "已添加" if metric.key in self.existing_keys else ""
                 self.tree.insert(parent_id, "end", iid=metric.key, text=metric.display, values=(state,))
+        self.tree.tag_configure("category", font=("Segoe UI", 10, "bold"), foreground="#0F2E4F")
 
         self.tree.bind("<Double-1>", lambda _event: self._accept())
         buttons = ttk.Frame(frame, style="Panel.TFrame")
-        buttons.pack(fill="x", pady=(12, 0))
+        buttons.pack(fill="x", pady=(16, 0))
         ttk.Button(buttons, text="取消", command=self.destroy).pack(side="right")
         ttk.Button(buttons, text="添加", command=self._accept, style="Accent.TButton").pack(side="right", padx=(0, 8))
         self.protocol("WM_DELETE_WINDOW", self.destroy)
@@ -1813,8 +1913,8 @@ class LandtWorkbenchApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"{APP_NAME}  {APP_VERSION}")
-        self.geometry("1500x900")
-        self.minsize(1180, 720)
+        self.geometry("1560x940")
+        self.minsize(1220, 760)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.option_add("*Font", "{Segoe UI} 10")
         self._configure_styles()
@@ -1837,7 +1937,6 @@ class LandtWorkbenchApp(tk.Tk):
         self.plot_mode_var = tk.StringVar(value="原始时序图")
         self.error_bar_var = tk.StringVar(value="标准差 SD")
         self.show_individual_cells_var = tk.BooleanVar(value=True)
-        self.show_stack_mean_var = tk.BooleanVar(value=True)
         self.title_var = tk.StringVar(value="LAND electrochemical data")
         self.time_unit_var = tk.StringVar(value="h")
         self.show_bottom_var = tk.BooleanVar(value=True)
@@ -1869,6 +1968,9 @@ class LandtWorkbenchApp(tk.Tk):
         except tk.TclError:
             pass
         style.configure(".", background="#F1F5F9", foreground="#0F172A")
+        style.configure("TLabel", padding=(0, 2))
+        style.configure("TButton", padding=(10, 6))
+        style.configure("TCheckbutton", padding=(0, 3))
         style.configure("Panel.TFrame", background="#F1F5F9")
         style.configure("Card.TFrame", background="#FFFFFF")
         style.configure("Toolbar.TFrame", background="#0F2E4F")
@@ -1883,8 +1985,9 @@ class LandtWorkbenchApp(tk.Tk):
         style.map("Toolbar.TButton", background=[("active", "#245786")])
         style.configure("Accordion.TButton", background="#E2E8F0", foreground="#0F2E4F", anchor="w", borderwidth=0, padding=(9, 7), font=("Segoe UI", 10, "bold"))
         style.map("Accordion.TButton", background=[("active", "#CBD5E1")])
-        style.configure("Treeview", rowheight=26, background="#FFFFFF", fieldbackground="#FFFFFF", borderwidth=0)
+        style.configure("Treeview", rowheight=30, background="#FFFFFF", fieldbackground="#FFFFFF", borderwidth=0, font=("Segoe UI", 10))
         style.configure("Treeview.Heading", background="#DCE6F1", foreground="#0F2E4F", font=("Segoe UI", 9, "bold"))
+        style.configure("Metric.Treeview", rowheight=32, background="#FFFFFF", fieldbackground="#FFFFFF", borderwidth=0, font=("Segoe UI", 10))
         style.map("Treeview", background=[("selected", "#DBEAFE")], foreground=[("selected", "#0F172A")])
         style.configure("Status.TLabel", background="#E2E8F0", foreground="#334155", padding=(8, 4))
 
@@ -1902,14 +2005,14 @@ class LandtWorkbenchApp(tk.Tk):
 
         main = ttk.Frame(self, style="Panel.TFrame")
         main.pack(fill="both", expand=True)
-        main.columnconfigure(0, minsize=300)
+        main.columnconfigure(0, minsize=310)
         main.columnconfigure(1, weight=1)
-        main.columnconfigure(2, minsize=340)
+        main.columnconfigure(2, minsize=370)
         main.rowconfigure(0, weight=1)
 
-        file_panel = ttk.Frame(main, style="Panel.TFrame", padding=10, width=300)
+        file_panel = ttk.Frame(main, style="Panel.TFrame", padding=12, width=310)
         plot_panel = ttk.Frame(main, style="Card.TFrame", padding=4)
-        settings_panel = ttk.Frame(main, style="Panel.TFrame", width=340)
+        settings_panel = ttk.Frame(main, style="Panel.TFrame", width=370)
         file_panel.grid(row=0, column=0, sticky="nsew")
         plot_panel.grid(row=0, column=1, sticky="nsew")
         settings_panel.grid(row=0, column=2, sticky="nsew")
@@ -1967,7 +2070,7 @@ class LandtWorkbenchApp(tk.Tk):
         detail_card = ttk.Frame(parent, style="Card.TFrame", padding=10)
         detail_card.pack(fill="x", pady=(8, 0))
         ttk.Label(detail_card, text="文件信息", style="CardSection.TLabel").pack(anchor="w")
-        ttk.Label(detail_card, textvariable=self.file_detail_var, style="CardHint.TLabel", wraplength=270, justify="left").pack(anchor="w", pady=(6, 0))
+        ttk.Label(detail_card, textvariable=self.file_detail_var, style="CardHint.TLabel", wraplength=282, justify="left").pack(anchor="w", pady=(8, 1))
         ttk.Label(
             parent,
             text="单击第一列可启用/停用；选中的第一项作为顶部圈数轴参考文件。",
@@ -2047,12 +2150,6 @@ class LandtWorkbenchApp(tk.Tk):
             variable=self.show_individual_cells_var,
         )
         self.individual_cells_check.pack(anchor="w", pady=(6, 1))
-        self.stack_mean_check = ttk.Checkbutton(
-            self.multi_battery_options,
-            text="Stack 图中叠加总体均值",
-            variable=self.show_stack_mean_var,
-        )
-        self.stack_mean_check.pack(anchor="w", pady=1)
 
         data_card = ttk.Frame(container, style="Card.TFrame", padding=10)
         data_card.pack(fill="x", padx=8, pady=5)
@@ -2085,7 +2182,12 @@ class LandtWorkbenchApp(tk.Tk):
         metric_buttons.pack(fill="x", pady=(8, 0))
         ttk.Button(metric_buttons, text="＋ 添加数据", command=self.add_plot_metrics).pack(side="left")
         ttk.Button(metric_buttons, text="－ 移除", command=self.remove_plot_metrics).pack(side="left", padx=(7, 0))
-        ttk.Button(metric_buttons, text="常用统计", command=self.add_common_statistics_metrics).pack(side="right")
+        self.common_metrics_button = ttk.Button(
+            metric_buttons,
+            text="常用曲线",
+            command=self.add_common_statistics_metrics,
+        )
+        self.common_metrics_button.pack(side="right")
 
         ttk.Button(
             container,
@@ -2238,9 +2340,12 @@ class LandtWorkbenchApp(tk.Tk):
         self.curve_count_var.set(f"已添加 {count} 项" if count else "尚未添加数据；点击 ＋ 开始")
 
     def add_plot_metrics(self) -> None:
-        source_filter: Literal["cycle"] | None = None
-        if PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time") in {"statistics", "stack"}:
+        source_filter: Literal["record", "cycle"] | None = None
+        mode = PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time")
+        if mode == "statistics":
             source_filter = "cycle"
+        elif mode == "stack":
+            source_filter = "record"
         dialog = AddMetricDialog(self, self.plot_metric_keys, source_filter=source_filter)
         self.wait_window(dialog)
         if not dialog.result:
@@ -2251,15 +2356,23 @@ class LandtWorkbenchApp(tk.Tk):
         self.status_var.set(f"已向绘图区添加 {len(dialog.result)} 项数据；点击“绘制所选范围”。")
 
     def add_common_statistics_metrics(self) -> None:
-        common_keys = ["coulombic_efficiency_pct", "discharge_specific_capacity_mah_g"]
+        mode = PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time")
+        if mode == "statistics":
+            common_keys = ["coulombic_efficiency_pct", "discharge_specific_capacity_mah_g"]
+            added_message = "已添加库伦效率和放电比容量；多电池统计模式默认绘制前 20 圈。"
+            existing_message = "库伦效率和放电比容量已经在绘图区中。"
+        else:
+            common_keys = ["voltage_v", "current_ma"]
+            added_message = "已添加电压和电流；原始曲线与 Stack 模式默认绘制前 5 圈。"
+            existing_message = "电压和电流已经在绘图区中。"
         added = [key for key in common_keys if key not in self.plot_metric_keys]
         self.plot_metric_keys.extend(added)
         self._refresh_curve_list()
         self._refresh_style_metric_choices()
         if added:
-            self.status_var.set("已添加库伦效率和放电比容量；多电池统计模式默认绘制前 20 圈。")
+            self.status_var.set(added_message)
         else:
-            self.status_var.set("库伦效率和放电比容量已经在绘图区中。")
+            self.status_var.set(existing_message)
 
     def remove_plot_metrics(self) -> None:
         indices = list(self.curve_listbox.curselection())
@@ -2282,23 +2395,18 @@ class LandtWorkbenchApp(tk.Tk):
     def _reset_plot_range(self) -> None:
         self.plot_cycle_start_var.set(1)
         mode = PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time")
-        self.plot_cycle_end_var.set(5 if mode == "time" else 20)
+        self.plot_cycle_end_var.set(20 if mode == "statistics" else 5)
 
     def _sync_plot_mode_controls(self) -> None:
         mode = PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time")
-        if mode == "time":
+        self.common_metrics_button.configure(text="常用统计" if mode == "statistics" else "电压＋电流")
+        if mode != "statistics":
             self.multi_battery_options.pack_forget()
             return
         if not self.multi_battery_options.winfo_manager():
             self.multi_battery_options.pack(fill="x")
-        if mode == "statistics":
-            self.error_bar_combo.configure(state="readonly")
-            self.individual_cells_check.configure(state="normal")
-            self.stack_mean_check.configure(state="disabled")
-        else:
-            self.error_bar_combo.configure(state="disabled")
-            self.individual_cells_check.configure(state="disabled")
-            self.stack_mean_check.configure(state="normal")
+        self.error_bar_combo.configure(state="readonly")
+        self.individual_cells_check.configure(state="normal")
 
     def _on_plot_mode_changed(self, _event: tk.Event | None = None) -> None:
         mode = PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time")
@@ -2307,20 +2415,26 @@ class LandtWorkbenchApp(tk.Tk):
             current_end = int(self.plot_cycle_end_var.get())
         except (tk.TclError, ValueError):
             current_start, current_end = 1, 5
-        if mode in {"statistics", "stack"} and current_start == 1 and current_end <= 5:
+        if mode == "statistics" and current_start == 1 and current_end <= 5:
             self.plot_cycle_end_var.set(20)
+        elif mode in {"time", "stack"} and current_start == 1 and current_end == 20:
+            self.plot_cycle_end_var.set(5)
         default_titles = {
             "time": "LAND electrochemical data",
             "statistics": "Multi-battery statistics",
-            "stack": "Multi-battery stack plot",
+            "stack": "Multi-battery raw-curve stack",
         }
         if self.title_var.get() in set(default_titles.values()):
             self.title_var.set(default_titles[mode])
         self._sync_plot_mode_controls()
-        if mode in {"statistics", "stack"}:
+        if mode == "statistics":
             non_cycle_count = sum(METRIC_BY_KEY[key].source != "cycle" for key in self.plot_metric_keys)
             suffix = f"；当前 {non_cycle_count} 个逐时刻指标将在该模式中忽略" if non_cycle_count else ""
-            self.status_var.set(f"多电池模式默认统计前 20 圈，点击 ＋ 可添加库伦效率、放电比容量等指标{suffix}。")
+            self.status_var.set(f"多电池统计默认绘制前 20 圈，点击 ＋ 可添加库伦效率、放电比容量等指标{suffix}。")
+        elif mode == "stack":
+            cycle_count = sum(METRIC_BY_KEY[key].source != "record" for key in self.plot_metric_keys)
+            suffix = f"；当前 {cycle_count} 个循环汇总指标将在该模式中忽略" if cycle_count else ""
+            self.status_var.set(f"Stack 模式按电池分层比较前 5 圈原始曲线，点击 ＋ 可添加电压、电流等逐时刻指标{suffix}。")
         else:
             self.status_var.set("已切换为原始时序图。")
 
@@ -2328,7 +2442,13 @@ class LandtWorkbenchApp(tk.Tk):
         dataset = self.primary_dataset()
         if not dataset or not dataset.cycles:
             mode = PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time")
-            self.plot_range_hint_var.set("默认统计第 1–20 圈" if mode != "time" else "默认只绘制第 1–5 圈")
+            if mode == "statistics":
+                hint = "默认统计第 1–20 圈"
+            elif mode == "stack":
+                hint = "默认分层比较第 1–5 圈"
+            else:
+                hint = "默认只绘制第 1–5 圈"
+            self.plot_range_hint_var.set(hint)
             return
         cycles = sorted(dataset.cycles)
         self.plot_range_hint_var.set(f"当前参考文件：第 {cycles[0]}–{cycles[-1]} 圈，共 {len(cycles)} 圈")
@@ -2483,7 +2603,6 @@ class LandtWorkbenchApp(tk.Tk):
             plot_mode=PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time"),  # type: ignore[arg-type]
             error_bar=ERROR_BAR_LABELS.get(self.error_bar_var.get(), "sd"),  # type: ignore[arg-type]
             show_individual_cells=self.show_individual_cells_var.get(),
-            show_stack_mean=self.show_stack_mean_var.get(),
             show_bottom_time=self.show_bottom_var.get(),
             show_top_cycle=self.show_top_var.get(),
             show_grid=self.show_grid_var.get(),
@@ -2512,9 +2631,14 @@ class LandtWorkbenchApp(tk.Tk):
                 mode_text = {
                     "time": "原始时序图",
                     "statistics": "多电池均值＋误差棒",
-                    "stack": "多电池 Stack 分层图",
+                    "stack": "多电池原始曲线 Stack",
                 }[options.plot_mode]
-                visible_metrics = _cycle_metric_keys(metrics) if options.plot_mode != "time" else metrics
+                if options.plot_mode == "statistics":
+                    visible_metrics = _cycle_metric_keys(metrics)
+                elif options.plot_mode == "stack":
+                    visible_metrics = _record_metric_keys(metrics)
+                else:
+                    visible_metrics = metrics
                 self.status_var.set(
                     f"{mode_text} · 第 {options.cycle_start}–{options.cycle_end} 圈 · "
                     f"{len(datasets)} 个电池 × {len(visible_metrics)} 个指标"
@@ -2534,7 +2658,7 @@ class LandtWorkbenchApp(tk.Tk):
         except (tk.TclError, ValueError):
             default_start, default_end = 1, 5
         default_layout: Literal["wide", "statistics"] = (
-            "statistics" if PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time") != "time" else "wide"
+            "statistics" if PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time") == "statistics" else "wide"
         )
         dialog = DataExportDialog(self, default_start, default_end, default_layout=default_layout)
         self.wait_window(dialog)
@@ -2713,12 +2837,12 @@ def run_self_test(source_dir: str | Path, output_dir: str | Path) -> int:
     )
     save_figure(statistics_figure, output / "self_test_statistics.png", dpi=160)
     stack_figure = Figure(figsize=(10, 7), dpi=110)
-    draw_cycle_stack_plot(
+    draw_record_stack_plot(
         stack_figure,
         subsets,
-        statistics_keys,
+        ["voltage_v", "current_ma"],
         styles,
-        PlotOptions(title="LAND stack self-test", cycle_start=1, cycle_end=20, plot_mode="stack"),
+        PlotOptions(title="LAND raw-curve stack self-test", cycle_start=1, cycle_end=5, plot_mode="stack"),
     )
     save_figure(stack_figure, output / "self_test_stack.png", dpi=160)
     export_cycle_statistics(
