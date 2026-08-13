@@ -1,0 +1,94 @@
+# 蓝电数据工作台
+
+这是一个面向蓝电（LAND）混合 CSV 导出文件的本地 Windows 桌面程序。它会自动拆分 `Cycle`、`Step`、`Record` 三层数据，用更直观的方式完成文件管理、指标选择、多坐标轴绘图和数据导出。
+
+最新 Windows 免安装版：[GitHub Releases](https://github.com/ta1krelax/landt-data-workbench/releases/latest)
+
+## 启动
+
+普通使用者可从 GitHub Releases 下载 `LAND-Data-Workbench.exe`，双击即可运行，不需要安装 Python。
+
+源码方式运行时，在当前电脑上可直接双击 `启动蓝电数据工作台.bat`。
+
+也可以在命令行运行：
+
+```powershell
+python landt_workbench.py
+```
+
+如果换到另一台电脑，推荐 Python 3.11 或更高版本，然后安装依赖：
+
+```powershell
+pip install -r requirements.txt
+```
+
+## 从源码构建 EXE
+
+安装依赖和 PyInstaller 后，在 PowerShell 中运行：
+
+```powershell
+pip install -r requirements.txt
+pip install pyinstaller
+powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
+```
+
+生成的免安装程序位于 `dist\LAND-Data-Workbench.exe`。构建产物不提交到 Git 历史，而是随正式版本上传到 GitHub Releases。
+
+## 基本操作
+
+1. 点击“导入文件”选择一个或多个 CSV，或者点击“导入文件夹”。
+2. 左侧文件管理区会在后台解析文件。单击文件名前的 `☑/☐` 可以启用或停用文件；选中的第一项是顶部圈数轴的参考文件。
+3. 右侧绘图范围默认是第 `1–5` 圈；需要查看其他圈段时，直接修改“从/到”。
+4. 绘图区数据初始为空。点击“＋ 添加数据”选择一个或多个指标；选中列表项后可用“－ 移除”删除。
+5. 点击“绘制所选范围”。图下方是时间轴，图上方默认显示参考文件的圈数轴。
+6. 颜色、线/点样式、Y 轴位置、时间单位、网格、图例、降采样点数和 DPI 位于默认收起的“高级设置”中。
+7. “导出图像”支持 PNG、SVG、PDF、EMF、EPS 和 TIFF；“导出数据”支持 CSV 和 XLSX。数据导出窗口有独立的起止圈设置，默认沿用当前绘图范围。
+
+## 可选数据
+
+- 逐时刻：电压、电流、步骤容量、步骤比容量、SOC/DOD、能量、比能量、功率、dQ/dV、dV/dQ、环境温度。
+- 累计量：累计充/放电容量及累计充/放电能量。
+- 循环汇总：库伦效率、充/放电容量、充/放电比容量、充/放电能量、能量效率、平均/中值电压、截止电压、保持率、充放电时长及 DCIR。
+
+循环汇总指标在图中每圈绘制一个点，横坐标取该圈结束时刻；在整理后的逐时刻数据中，循环汇总值会展开到该圈的每条记录，方便筛选和进一步计算。
+
+## 整理后数据格式
+
+程序提供两种布局：
+
+- 宽表：前三列为 `Time (s)`、`Cycle`、`Step (within cycle)`，第 4 列开始是用户选择的指标。
+- 长表：前三列同上，第 4 列固定为 `Value`，随后是 `Metric` 和 `Unit`。这与“时间—圈数—步骤—数据”的结构完全对应。
+
+`Step (within cycle)` 会在每一圈内从 1 重新编号。程序还会提供友好的 `Step Phase`（Waiting、Waiting 2、Charging、Discharging 等）；蓝电原始模式（Rest/CVC/CCD 等）和全局 `StepNo` 分别保存在 `Step Mode`、`Source Step No` 中，便于回溯。文件名、步骤状态和系统时间也会保留。
+
+XLSX 导出会为每个文件建立数据表，并附带：
+
+- `Cycle Summary`：每圈汇总数据。
+- `Step Summary`：每步骤汇总数据。
+- `Index`：文件、记录数和对应工作表索引。
+
+指定导出圈数后，逐时刻明细、`Cycle Summary`、`Step Summary` 和 `Index` 统计都会使用同一个圈数范围。
+
+## 图像格式说明
+
+- SVG/PDF/EPS：优先用于论文排版或继续编辑，保持矢量曲线和文字。
+- PNG/TIFF：适合演示文稿和快速分享，可在右侧设置 DPI。
+- EMF：使用 Windows GDI 生成，兼容 Origin、Office 等 Windows 软件。EMF 内嵌高分辨率位图；如果需要完全可编辑的矢量对象，建议优先导出 SVG 或 PDF。
+
+## 性能和数据安全
+
+- 多文件解析在后台线程执行，避免界面卡死。
+- 默认只绘制前 5 圈，避免数百圈测试导入后立即生成过密图像。
+- 长曲线绘图使用保留局部极值的降采样；导出的指定圈段始终保留完整数据，不会降采样。
+- 程序只读取源 CSV，不会修改原文件。
+- 同时导入大量文件会占用较多内存；可通过左侧启用/停用控制当前绘图内容。
+
+## 自检
+
+开发或迁移电脑后，可以用真实 CSV 文件夹执行：
+
+```powershell
+python landt_workbench.py --self-test "C:\data\LAND-export" --test-output self_test_output
+```
+
+自检会解析一份 mAh 文件和一份 μAh 文件，并测试 PNG、SVG、EMF、CSV 和 XLSX 导出。
