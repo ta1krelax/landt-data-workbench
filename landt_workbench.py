@@ -41,7 +41,7 @@ matplotlib.use("TkAgg")
 from matplotlib import pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
-from matplotlib.ticker import FuncFormatter, MaxNLocator
+from matplotlib.ticker import FuncFormatter, MaxNLocator, MultipleLocator
 
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
@@ -51,7 +51,7 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 
 
 APP_NAME = "蓝电数据工作台"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 PLOT_MODE_LABELS = {
     "原始时序图": "time",
@@ -1195,6 +1195,25 @@ class CurveStyle:
 
 
 @dataclass
+class AxisStyle:
+    """Persistent Origin-like scale and grid overrides for one logical axis."""
+
+    minimum: float | None = None
+    maximum: float | None = None
+    major_interval: float | None = None
+    grid_visible: bool | None = None
+    grid_color: str = "#CBD5E1"
+    grid_line_style: Literal["-", "--", ":", "-."] = "-"
+    grid_line_width: float = 0.6
+
+
+@dataclass
+class PlotAppearance:
+    figure_background: str = "#F8FAFC"
+    plot_background: str = "#FFFFFF"
+
+
+@dataclass
 class PlotOptions:
     title: str = "LAND electrochemical data"
     time_unit: Literal["s", "min", "h"] = "h"
@@ -1208,6 +1227,8 @@ class PlotOptions:
     show_grid: bool = True
     show_legend: bool = True
     max_points_per_curve: int = 12_000
+    axis_styles: dict[str, AxisStyle] = field(default_factory=dict)
+    appearance: PlotAppearance = field(default_factory=PlotAppearance)
 
 
 def time_factor_and_label(unit: str) -> tuple[float, str]:
@@ -1216,6 +1237,66 @@ def time_factor_and_label(unit: str) -> tuple[float, str]:
     if unit == "min":
         return 60.0, "Time (min)"
     return 3600.0, "Time (h)"
+
+
+def axis_style(options: PlotOptions, key: str) -> AxisStyle:
+    return options.axis_styles.get(key, AxisStyle())
+
+
+def tag_curve(line: Any, metric_key: str) -> None:
+    """Attach hit-test metadata used by the Origin-like double-click editor."""
+    setattr(line, "_landt_metric_key", metric_key)
+    line.set_picker(7)
+
+
+def tag_x_axis(axis: Any, role: Literal["time", "cycle"], has_cycle_overlay: bool = False) -> None:
+    setattr(axis, "_landt_x_role", role)
+    setattr(axis, "_landt_has_cycle_overlay", has_cycle_overlay)
+
+
+def tag_y_axis(axis: Any, metric_key: str) -> None:
+    setattr(axis, "_landt_metric_key", metric_key)
+
+
+def apply_numeric_axis_style(axis: Any, config: AxisStyle, orientation: Literal["x", "y"], factor: float = 1.0) -> None:
+    """Apply optional limits and major tick increment; time values are stored in seconds."""
+    if orientation == "x":
+        current = axis.get_xlim()
+        lower = config.minimum / factor if config.minimum is not None else current[0]
+        upper = config.maximum / factor if config.maximum is not None else current[1]
+        if lower < upper:
+            axis.set_xlim(lower, upper)
+        if config.major_interval is not None and config.major_interval > 0:
+            axis.xaxis.set_major_locator(MultipleLocator(config.major_interval / factor))
+    else:
+        current = axis.get_ylim()
+        lower = config.minimum if config.minimum is not None else current[0]
+        upper = config.maximum if config.maximum is not None else current[1]
+        if lower < upper:
+            axis.set_ylim(lower, upper)
+        if config.major_interval is not None and config.major_interval > 0:
+            axis.yaxis.set_major_locator(MultipleLocator(config.major_interval))
+
+
+def apply_grid_style(
+    axis: Any,
+    config: AxisStyle,
+    orientation: Literal["x", "y"],
+    default_visible: bool,
+) -> None:
+    visible = default_visible if config.grid_visible is None else config.grid_visible
+    target = axis.xaxis if orientation == "x" else axis.yaxis
+    if not visible:
+        target.grid(False, which="major")
+        return
+    target.grid(
+        True,
+        which="major",
+        color=config.grid_color,
+        linestyle=config.grid_line_style,
+        linewidth=config.grid_line_width,
+        alpha=0.72,
+    )
 
 
 def minmax_decimate(x_values: np.ndarray, y_values: np.ndarray, max_points: int) -> tuple[np.ndarray, np.ndarray]:
@@ -1262,8 +1343,9 @@ def draw_plot(
     """Draw selected metrics with one independently configurable y-axis per metric."""
     figure.clear()
     base = figure.add_subplot(111)
-    base.set_facecolor("#FFFFFF")
-    figure.patch.set_facecolor("#F8FAFC")
+    base.set_facecolor(options.appearance.plot_background)
+    figure.patch.set_facecolor(options.appearance.figure_background)
+    tag_x_axis(base, "time", has_cycle_overlay=options.show_top_cycle)
     if not datasets or not metric_keys:
         base.text(
             0.5,
@@ -1291,6 +1373,7 @@ def draw_plot(
         metric = METRIC_BY_KEY[metric_key]
         style = styles[metric_key]
         axis = base if metric_index == 0 else base.twinx()
+        tag_y_axis(axis, metric_key)
         axes.append(axis)
         side, offset = layout[metric_key]
 
@@ -1337,6 +1420,7 @@ def draw_plot(
                 alpha=alpha,
                 label=f"{dataset.name} | {metric.label}",
             )
+            tag_curve(line, metric_key)
             all_handles.append(line)
             all_labels.append(line.get_label())
 
@@ -1360,27 +1444,47 @@ def draw_plot(
     base.tick_params(axis="x", bottom=options.show_bottom_time, labelbottom=options.show_bottom_time, labelsize=8)
     base.xaxis.set_major_locator(MaxNLocator(nbins=10, min_n_ticks=4))
     base.set_title(options.title, fontsize=13, fontweight="bold", color="#0F172A", pad=14)
-    base.grid(options.show_grid, color="#CBD5E1", linewidth=0.6, alpha=0.65)
     base.spines["top"].set_visible(False)
     for axis in axes:
         axis.spines["top"].set_visible(False)
+
+    time_config = axis_style(options, "time")
+    apply_numeric_axis_style(base, time_config, "x", time_factor)
+    apply_grid_style(base, time_config, "x", options.show_grid)
 
     if options.show_top_cycle:
         reference = primary_dataset if primary_dataset in datasets else datasets[0]
         anchor_x, cycles = reference.cycle_anchors(options.cycle_start, options.cycle_end)
         if len(anchor_x):
-            step = max(1, math.ceil(len(anchor_x) / 12))
-            indices = np.arange(0, len(anchor_x), step, dtype=int)
+            cycle_config = axis_style(options, "cycle")
+            if cycle_config.major_interval is not None and cycle_config.major_interval >= 1:
+                interval = max(1, int(round(cycle_config.major_interval)))
+                indices = np.asarray(
+                    [index for index, cycle in enumerate(cycles) if (int(cycle) - options.cycle_start) % interval == 0],
+                    dtype=int,
+                )
+                if not len(indices):
+                    indices = np.asarray([0], dtype=int)
+            else:
+                step = max(1, math.ceil(len(anchor_x) / 12))
+                indices = np.arange(0, len(anchor_x), step, dtype=int)
             if indices[-1] != len(anchor_x) - 1:
                 indices = np.append(indices, len(anchor_x) - 1)
             top_axis = base.twiny()
+            tag_x_axis(top_axis, "cycle")
             top_axis.set_xlim(base.get_xlim())
             top_axis.set_xticks(anchor_x[indices] / time_factor)
             top_axis.set_xticklabels([str(value) for value in cycles[indices]], fontsize=8)
             top_axis.set_xlabel(f"Cycle ({reference.name})", fontsize=10, labelpad=7)
             top_axis.spines["top"].set_color("#475569")
             top_axis.tick_params(axis="x", colors="#475569")
+            apply_grid_style(top_axis, cycle_config, "x", False)
             axes.append(top_axis)
+
+    for metric_index, (metric_key, axis) in enumerate(zip(metric_keys, axes[: len(metric_keys)])):
+        y_config = axis_style(options, f"y:{metric_key}")
+        apply_numeric_axis_style(axis, y_config, "y")
+        apply_grid_style(axis, y_config, "y", options.show_grid and metric_index == 0)
 
     if options.show_legend and all_handles:
         column_count = 1 if len(all_handles) < 7 else 2
@@ -1437,7 +1541,7 @@ def draw_cycle_statistics_plot(
         return _empty_plot_message(figure, "多电池统计需要导入文件并添加至少一个循环汇总指标")
 
     figure.clear()
-    figure.patch.set_facecolor("#F8FAFC")
+    figure.patch.set_facecolor(options.appearance.figure_background)
     axes_array = figure.subplots(len(cycle_keys), 1, sharex=True, squeeze=False)
     axes = [axes_array[index, 0] for index in range(len(cycle_keys))]
     error_labels = {"sd": "SD", "sem": "SEM", "none": "无误差棒"}
@@ -1447,14 +1551,16 @@ def draw_cycle_statistics_plot(
         style = styles[key]
         result = compute_cycle_statistics(datasets, key, options.cycle_start, options.cycle_end)
         valid = result.n > 0
-        axis.set_facecolor("#FFFFFF")
+        axis.set_facecolor(options.appearance.plot_background)
+        tag_x_axis(axis, "cycle")
+        tag_y_axis(axis, key)
 
         if options.show_individual_cells:
             for dataset_index, dataset in enumerate(datasets):
                 cell_values = result.values[dataset_index]
                 cell_valid = np.isfinite(cell_values)
                 if np.any(cell_valid):
-                    axis.plot(
+                    cell_line, = axis.plot(
                         result.cycles[cell_valid],
                         cell_values[cell_valid],
                         color=style.color,
@@ -1464,6 +1570,7 @@ def draw_cycle_statistics_plot(
                         markersize=max(1.5, style.marker_size * 0.55),
                         label="单个电池" if dataset_index == 0 else "_nolegend_",
                     )
+                    tag_curve(cell_line, key)
 
         if np.any(valid):
             y_error: np.ndarray | None
@@ -1475,7 +1582,7 @@ def draw_cycle_statistics_plot(
                 y_error = None
             marker = "o" if style.plot_type in ("point", "line+point") else None
             linestyle = "None" if style.plot_type == "point" else "-"
-            axis.errorbar(
+            error_container = axis.errorbar(
                 result.cycles[valid],
                 result.mean[valid],
                 yerr=y_error,
@@ -1491,6 +1598,7 @@ def draw_cycle_statistics_plot(
                 label=f"Mean ± {error_labels[options.error_bar]}" if y_error is not None else "Mean",
                 zorder=5,
             )
+            tag_curve(error_container.lines[0], key)
             positive_n = result.n[valid]
             n_text = f"n={int(positive_n[0])}" if np.all(positive_n == positive_n[0]) else f"n={int(np.min(positive_n))}–{int(np.max(positive_n))}"
             axis.text(0.99, 0.96, n_text, transform=axis.transAxes, ha="right", va="top", fontsize=8, color="#64748B")
@@ -1499,17 +1607,29 @@ def draw_cycle_statistics_plot(
 
         axis.set_ylabel(metric.display, color=style.color, fontsize=9)
         axis.tick_params(axis="y", labelsize=8, colors=style.color)
-        axis.grid(options.show_grid, color="#CBD5E1", linewidth=0.6, alpha=0.65)
         axis.spines["top"].set_visible(False)
         axis.spines["right"].set_visible(False)
+        y_config = axis_style(options, f"y:{key}")
+        apply_numeric_axis_style(axis, y_config, "y")
+        apply_grid_style(axis, y_config, "y", options.show_grid)
         if options.show_legend:
             axis.legend(loc="best", fontsize=7, framealpha=0.9)
         if metric_index < len(axes) - 1:
             axis.tick_params(axis="x", labelbottom=False)
 
-    axes[-1].set_xlabel("Cycle", fontsize=10)
+    axes[-1].set_xlabel("Cycle" if options.show_top_cycle else "", fontsize=10)
+    if not options.show_top_cycle:
+        axes[-1].tick_params(axis="x", bottom=False, labelbottom=False)
+        axes[-1].spines["bottom"].set_visible(False)
     axes[-1].set_xlim(options.cycle_start - 0.4, options.cycle_end + 0.4)
-    axes[-1].xaxis.set_major_locator(MaxNLocator(integer=True, nbins=min(12, max(4, options.cycle_end - options.cycle_start + 1))))
+    cycle_config = axis_style(options, "cycle")
+    if cycle_config.major_interval is not None and cycle_config.major_interval >= 1:
+        for axis in axes:
+            axis.xaxis.set_major_locator(MultipleLocator(max(1, int(round(cycle_config.major_interval)))))
+    else:
+        axes[-1].xaxis.set_major_locator(MaxNLocator(integer=True, nbins=min(12, max(4, options.cycle_end - options.cycle_start + 1))))
+    for axis in axes:
+        apply_grid_style(axis, cycle_config, "x", options.show_grid)
     figure.suptitle(options.title or "Multi-battery statistics", fontsize=13, fontweight="bold", color="#0F172A", y=0.985)
     figure.subplots_adjust(left=0.13, right=0.96, top=0.92, bottom=0.10, hspace=0.14)
     return axes
@@ -1528,7 +1648,7 @@ def draw_record_stack_plot(
         return _empty_plot_message(figure, "Stack 图需要导入文件并添加电压、电流等逐时刻指标")
 
     figure.clear()
-    figure.patch.set_facecolor("#F8FAFC")
+    figure.patch.set_facecolor(options.appearance.figure_background)
     base_array = figure.subplots(len(datasets), 1, sharex=True, squeeze=False)
     base_axes = [base_array[index, 0] for index in range(len(datasets))]
     all_axes: list[Any] = []
@@ -1536,10 +1656,12 @@ def draw_record_stack_plot(
     y_bounds: dict[str, list[float]] = {key: [math.inf, -math.inf] for key in record_keys}
     layout = resolved_axis_layout(record_keys, styles)
     time_factor, time_label = time_factor_and_label(options.time_unit)
+    cycle_config = axis_style(options, "cycle")
     max_x = 0.0
 
     for dataset_index, (base, dataset) in enumerate(zip(base_axes, datasets)):
-        base.set_facecolor("#FFFFFF")
+        base.set_facecolor(options.appearance.plot_background)
+        tag_x_axis(base, "time", has_cycle_overlay=options.show_top_cycle)
         selected_times = [
             row.elapsed_s
             for row in dataset.records
@@ -1558,6 +1680,7 @@ def draw_record_stack_plot(
             metric = METRIC_BY_KEY[key]
             style = styles[key]
             axis = base if metric_index == 0 else base.twinx()
+            tag_y_axis(axis, key)
             all_axes.append(axis)
             metric_axes[key].append(axis)
             side, offset = layout[key]
@@ -1607,6 +1730,7 @@ def draw_record_stack_plot(
                 alpha=0.92,
                 label=metric.display,
             )
+            tag_curve(line, key)
             panel_handles.append(line)
             panel_labels.append(metric.display)
 
@@ -1623,8 +1747,11 @@ def draw_record_stack_plot(
             bbox={"boxstyle": "round,pad=0.22", "facecolor": "white", "edgecolor": "#CBD5E1", "alpha": 0.88},
             zorder=10,
         )
-        base.grid(options.show_grid, color="#CBD5E1", linewidth=0.55, alpha=0.60)
         base.xaxis.set_major_locator(MaxNLocator(nbins=10, min_n_ticks=4))
+        apply_grid_style(base, axis_style(options, "time"), "x", options.show_grid)
+        panel_metric_axes = all_axes[-len(record_keys) :] if len(all_axes) >= len(record_keys) else []
+        for metric_index, (key, axis) in enumerate(zip(record_keys, panel_metric_axes)):
+            apply_grid_style(axis, axis_style(options, f"y:{key}"), "y", options.show_grid and metric_index == 0)
         if dataset_index < len(base_axes) - 1 or not options.show_bottom_time:
             base.tick_params(axis="x", labelbottom=False, bottom=options.show_bottom_time)
         else:
@@ -1634,10 +1761,30 @@ def draw_record_stack_plot(
             anchors, cycles = dataset.cycle_anchors(options.cycle_start, options.cycle_end)
             if len(anchors):
                 anchors = (anchors - range_start_s) / time_factor
-                label_step = max(1, math.ceil(len(anchors) / 12))
+                if cycle_config.major_interval is not None and cycle_config.major_interval >= 1:
+                    interval = max(1, int(round(cycle_config.major_interval)))
+                    show_indices = {
+                        index
+                        for index, cycle in enumerate(cycles)
+                        if (int(cycle) - options.cycle_start) % interval == 0
+                    }
+                    show_indices.add(len(cycles) - 1)
+                else:
+                    label_step = max(1, math.ceil(len(anchors) / 12))
+                    show_indices = set(range(0, len(anchors), label_step))
+                    show_indices.add(len(anchors) - 1)
+                show_cycle_grid = options.show_grid if cycle_config.grid_visible is None else cycle_config.grid_visible
                 for marker_index, (anchor, cycle) in enumerate(zip(anchors, cycles)):
-                    base.axvline(anchor, color="#94A3B8", linewidth=0.55, linestyle=":", alpha=0.65, zorder=0)
-                    if marker_index % label_step == 0 or marker_index == len(anchors) - 1:
+                    if marker_index in show_indices and show_cycle_grid:
+                        base.axvline(
+                            anchor,
+                            color=cycle_config.grid_color,
+                            linewidth=cycle_config.grid_line_width,
+                            linestyle=cycle_config.grid_line_style,
+                            alpha=0.68,
+                            zorder=0,
+                        )
+                    if marker_index in show_indices:
                         base.text(
                             anchor,
                             0.98,
@@ -1659,9 +1806,11 @@ def draw_record_stack_plot(
         margin = span * 0.06 if span > 0 else max(abs(high) * 0.04, 0.05)
         for axis in axes_for_metric:
             axis.set_ylim(low - margin, high + margin)
+            apply_numeric_axis_style(axis, axis_style(options, f"y:{key}"), "y")
 
     x_margin = max_x * 0.015 if max_x > 0 else 1.0
     base_axes[-1].set_xlim(-x_margin, max_x + x_margin)
+    apply_numeric_axis_style(base_axes[-1], axis_style(options, "time"), "x", time_factor)
     base_axes[-1].set_xlabel(time_label if options.show_bottom_time else "", fontsize=10)
     left_axes = sum(1 for key in record_keys if layout[key][0] == "left")
     right_axes = len(record_keys) - left_axes
@@ -1817,6 +1966,352 @@ class AddMetricDialog(tk.Toplevel):
         self.destroy()
 
 
+class CurvePropertiesDialog(tk.Toplevel):
+    """Origin-inspired Plot Details dialog for one logical metric curve."""
+
+    def __init__(self, master: tk.Misc, metric: MetricDef, curve_style: CurveStyle) -> None:
+        super().__init__(master)
+        self.title(f"曲线属性 — {metric.display}")
+        self.geometry("540x600")
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+        self.result: dict[str, Any] | None = None
+        self.color = curve_style.color
+        self.plot_type_var = tk.StringVar(
+            value={"line": "线", "point": "点", "line+point": "线＋点"}[curve_style.plot_type]
+        )
+        self.line_width_var = tk.DoubleVar(value=curve_style.line_width)
+        self.marker_size_var = tk.DoubleVar(value=curve_style.marker_size)
+        self.side_var = tk.StringVar(value={"auto": "自动", "left": "左", "right": "右"}[curve_style.side])
+        self.offset_var = tk.IntVar(value=curve_style.offset)
+        self.visible_var = tk.BooleanVar(value=curve_style.axis_visible)
+
+        outer = ttk.Frame(self, padding=18, style="Panel.TFrame")
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text=metric.display, style="Section.TLabel").pack(anchor="w", pady=(0, 10))
+        notebook = ttk.Notebook(outer)
+        notebook.pack(fill="both", expand=True)
+        line_tab = ttk.Frame(notebook, padding=16, style="Card.TFrame")
+        axis_tab = ttk.Frame(notebook, padding=16, style="Card.TFrame")
+        notebook.add(line_tab, text="线条与符号")
+        notebook.add(axis_tab, text="关联 Y 轴")
+
+        ttk.Label(line_tab, text="颜色", style="CardHint.TLabel").grid(row=0, column=0, sticky="w")
+        self.color_button = tk.Button(line_tab, text="      ", bg=self.color, relief="flat", command=self._choose_color)
+        self.color_button.grid(row=1, column=0, sticky="w", pady=(4, 14))
+        ttk.Label(line_tab, text="绘制方式", style="CardHint.TLabel").grid(row=0, column=1, sticky="w", padx=(18, 0))
+        ttk.Combobox(
+            line_tab,
+            textvariable=self.plot_type_var,
+            values=("线", "点", "线＋点"),
+            state="readonly",
+            width=14,
+        ).grid(row=1, column=1, sticky="ew", padx=(18, 0), pady=(4, 14))
+        ttk.Label(line_tab, text="线宽", style="CardHint.TLabel").grid(row=2, column=0, sticky="w")
+        ttk.Spinbox(line_tab, from_=0.2, to=10, increment=0.2, textvariable=self.line_width_var, width=12).grid(
+            row=3, column=0, sticky="w", pady=(4, 14)
+        )
+        ttk.Label(line_tab, text="点大小", style="CardHint.TLabel").grid(row=2, column=1, sticky="w", padx=(18, 0))
+        ttk.Spinbox(line_tab, from_=0.5, to=24, increment=0.5, textvariable=self.marker_size_var, width=12).grid(
+            row=3, column=1, sticky="ew", padx=(18, 0), pady=(4, 14)
+        )
+        ttk.Label(
+            line_tab,
+            text="修改会应用到当前指标在所有已启用电池中的曲线。",
+            style="CardHint.TLabel",
+            wraplength=400,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        line_tab.columnconfigure(1, weight=1)
+
+        ttk.Label(axis_tab, text="轴位置", style="CardHint.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            axis_tab,
+            textvariable=self.side_var,
+            values=("自动", "左", "右"),
+            state="readonly",
+            width=14,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 14))
+        ttk.Label(axis_tab, text="轴外移距离 (px)", style="CardHint.TLabel").grid(row=0, column=1, sticky="w", padx=(18, 0))
+        ttk.Spinbox(axis_tab, from_=0, to=300, increment=10, textvariable=self.offset_var, width=12).grid(
+            row=1, column=1, sticky="ew", padx=(18, 0), pady=(4, 14)
+        )
+        ttk.Checkbutton(axis_tab, text="显示该指标的 Y 轴与刻度标签", variable=self.visible_var).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(4, 0)
+        )
+        axis_tab.columnconfigure(1, weight=1)
+
+        buttons = ttk.Frame(outer, style="Panel.TFrame")
+        buttons.pack(fill="x", pady=(15, 0))
+        ttk.Button(buttons, text="取消", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="确定", command=self._accept, style="Accent.TButton").pack(side="right", padx=(0, 8))
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+    def _choose_color(self) -> None:
+        color = colorchooser.askcolor(self.color, parent=self, title="选择曲线颜色")[1]
+        if color:
+            self.color = color
+            self.color_button.configure(bg=color, activebackground=color)
+
+    def _accept(self) -> None:
+        try:
+            line_width = float(self.line_width_var.get())
+            marker_size = float(self.marker_size_var.get())
+            offset = int(self.offset_var.get())
+            if line_width <= 0 or marker_size <= 0 or offset < 0:
+                raise ValueError
+        except (tk.TclError, ValueError):
+            messagebox.showerror(APP_NAME, "线宽、点大小必须为正数，轴外移距离不能为负数。", parent=self)
+            return
+        self.result = {
+            "color": self.color,
+            "plot_type": {"线": "line", "点": "point", "线＋点": "line+point"}[self.plot_type_var.get()],
+            "line_width": line_width,
+            "marker_size": marker_size,
+            "side": {"自动": "auto", "左": "left", "右": "right"}[self.side_var.get()],
+            "offset": offset,
+            "axis_visible": self.visible_var.get(),
+        }
+        self.destroy()
+
+
+class AxisPropertiesDialog(tk.Toplevel):
+    """Compact Scale/Grids axis dialog modeled after Origin's tab structure."""
+
+    LINE_STYLE_LABELS = {"实线": "-", "虚线": "--", "点线": ":", "点划线": "-."}
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        title: str,
+        role: Literal["time", "cycle", "y"],
+        config: AxisStyle,
+        current_bounds: tuple[float, float],
+        visible: bool,
+        display_factor: float = 1.0,
+        unit: str = "",
+        default_grid: bool = True,
+    ) -> None:
+        super().__init__(master)
+        self.title(f"坐标轴属性 — {title}")
+        self.geometry("570x640")
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+        self.result: dict[str, Any] | None = None
+        self.role = role
+        self.display_factor = display_factor
+        self.current_bounds = current_bounds
+        self.grid_color = config.grid_color
+
+        if role == "cycle":
+            from_value = str(int(round(current_bounds[0])))
+            to_value = str(int(round(current_bounds[1])))
+        else:
+            from_value = "" if config.minimum is None else f"{config.minimum / display_factor:g}"
+            to_value = "" if config.maximum is None else f"{config.maximum / display_factor:g}"
+        interval_value = "" if config.major_interval is None else f"{config.major_interval / display_factor:g}"
+        self.from_var = tk.StringVar(value=from_value)
+        self.to_var = tk.StringVar(value=to_value)
+        self.interval_var = tk.StringVar(value=interval_value)
+        self.visible_var = tk.BooleanVar(value=visible)
+        self.grid_visible_var = tk.BooleanVar(
+            value=default_grid if config.grid_visible is None else config.grid_visible
+        )
+        self.grid_style_var = tk.StringVar(
+            value=next((label for label, value in self.LINE_STYLE_LABELS.items() if value == config.grid_line_style), "实线")
+        )
+        self.grid_width_var = tk.DoubleVar(value=config.grid_line_width)
+
+        outer = ttk.Frame(self, padding=18, style="Panel.TFrame")
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text=title, style="Section.TLabel").pack(anchor="w", pady=(0, 10))
+        notebook = ttk.Notebook(outer)
+        notebook.pack(fill="both", expand=True)
+        scale_tab = ttk.Frame(notebook, padding=18, style="Card.TFrame")
+        grid_tab = ttk.Frame(notebook, padding=18, style="Card.TFrame")
+        notebook.add(scale_tab, text="刻度 Scale")
+        notebook.add(grid_tab, text="网格 Grids")
+
+        from_label = "起始圈" if role == "cycle" else f"起点 From{f' ({unit})' if unit else ''}"
+        to_label = "结束圈" if role == "cycle" else f"终点 To{f' ({unit})' if unit else ''}"
+        interval_label = "圈号 / 主刻度间隔" if role == "cycle" else f"主刻度与网格间隔{f' ({unit})' if unit else ''}"
+        ttk.Label(scale_tab, text=from_label, style="CardHint.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Entry(scale_tab, textvariable=self.from_var, width=18).grid(row=1, column=0, sticky="ew", pady=(4, 14))
+        ttk.Label(scale_tab, text=to_label, style="CardHint.TLabel").grid(row=0, column=1, sticky="w", padx=(18, 0))
+        ttk.Entry(scale_tab, textvariable=self.to_var, width=18).grid(row=1, column=1, sticky="ew", padx=(18, 0), pady=(4, 14))
+        ttk.Label(scale_tab, text=interval_label, style="CardHint.TLabel").grid(row=2, column=0, columnspan=2, sticky="w")
+        ttk.Entry(scale_tab, textvariable=self.interval_var, width=18).grid(row=3, column=0, sticky="ew", pady=(4, 14))
+        ttk.Checkbutton(scale_tab, text="显示坐标轴、标题与刻度标签", variable=self.visible_var).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(4, 10)
+        )
+        hint = (
+            "圈数范围同时决定参与绘图的数据。"
+            if role == "cycle"
+            else f"起点、终点或间隔留空表示自动；当前自动范围约为 {current_bounds[0]:g}–{current_bounds[1]:g}。"
+        )
+        ttk.Label(scale_tab, text=hint, style="CardHint.TLabel", wraplength=420).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+        scale_tab.columnconfigure(0, weight=1)
+        scale_tab.columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(grid_tab, text="显示主网格线", variable=self.grid_visible_var).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 15)
+        )
+        ttk.Label(grid_tab, text="网格线颜色", style="CardHint.TLabel").grid(row=1, column=0, sticky="w")
+        self.grid_color_button = tk.Button(grid_tab, text="      ", bg=self.grid_color, relief="flat", command=self._choose_grid_color)
+        self.grid_color_button.grid(row=2, column=0, sticky="w", pady=(4, 14))
+        ttk.Label(grid_tab, text="线型", style="CardHint.TLabel").grid(row=1, column=1, sticky="w", padx=(18, 0))
+        ttk.Combobox(
+            grid_tab,
+            textvariable=self.grid_style_var,
+            values=tuple(self.LINE_STYLE_LABELS),
+            state="readonly",
+            width=14,
+        ).grid(row=2, column=1, sticky="ew", padx=(18, 0), pady=(4, 14))
+        ttk.Label(grid_tab, text="线宽", style="CardHint.TLabel").grid(row=3, column=0, sticky="w")
+        ttk.Spinbox(grid_tab, from_=0.2, to=5, increment=0.1, textvariable=self.grid_width_var, width=12).grid(
+            row=4, column=0, sticky="w", pady=(4, 0)
+        )
+        grid_tab.columnconfigure(1, weight=1)
+
+        buttons = ttk.Frame(outer, style="Panel.TFrame")
+        buttons.pack(fill="x", pady=(15, 0))
+        ttk.Button(buttons, text="取消", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="确定", command=self._accept, style="Accent.TButton").pack(side="right", padx=(0, 8))
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+    def _choose_grid_color(self) -> None:
+        color = colorchooser.askcolor(self.grid_color, parent=self, title="选择网格线颜色")[1]
+        if color:
+            self.grid_color = color
+            self.grid_color_button.configure(bg=color, activebackground=color)
+
+    @staticmethod
+    def _optional_number(text: str) -> float | None:
+        stripped = text.strip()
+        return None if not stripped else float(stripped)
+
+    def _accept(self) -> None:
+        try:
+            lower = self._optional_number(self.from_var.get())
+            upper = self._optional_number(self.to_var.get())
+            interval = self._optional_number(self.interval_var.get())
+            if self.role == "cycle" and (lower is None or upper is None):
+                raise ValueError("圈数轴必须填写起始圈与结束圈。")
+            effective_lower = self.current_bounds[0] if lower is None else lower
+            effective_upper = self.current_bounds[1] if upper is None else upper
+            if effective_lower >= effective_upper:
+                raise ValueError("起点必须小于终点。")
+            if interval is not None and interval <= 0:
+                raise ValueError("主刻度间隔必须大于 0。")
+            if self.role == "cycle" and any(value is not None and abs(value - round(value)) > 1e-9 for value in (lower, upper, interval)):
+                raise ValueError("圈数范围和圈号间隔必须为整数。")
+            grid_width = float(self.grid_width_var.get())
+            if grid_width <= 0:
+                raise ValueError("网格线宽必须大于 0。")
+        except (tk.TclError, ValueError) as exc:
+            messagebox.showerror(APP_NAME, str(exc) or "请输入有效的坐标轴参数。", parent=self)
+            return
+        self.result = {
+            "minimum": None if lower is None else lower * self.display_factor,
+            "maximum": None if upper is None else upper * self.display_factor,
+            "major_interval": None if interval is None else interval * self.display_factor,
+            "visible": self.visible_var.get(),
+            "grid_visible": self.grid_visible_var.get(),
+            "grid_color": self.grid_color,
+            "grid_line_style": self.LINE_STYLE_LABELS[self.grid_style_var.get()],
+            "grid_line_width": grid_width,
+        }
+        self.destroy()
+
+
+class PlotLayerPropertiesDialog(tk.Toplevel):
+    """Edit plot-layer appearance after double-clicking empty canvas space."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        title: str,
+        appearance: PlotAppearance,
+        show_grid: bool,
+        show_legend: bool,
+        show_bottom: bool,
+        show_top: bool,
+    ) -> None:
+        super().__init__(master)
+        self.title("图层属性")
+        self.geometry("550x570")
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+        self.result: dict[str, Any] | None = None
+        self.title_var = tk.StringVar(value=title)
+        self.figure_color = appearance.figure_background
+        self.plot_color = appearance.plot_background
+        self.show_grid_var = tk.BooleanVar(value=show_grid)
+        self.show_legend_var = tk.BooleanVar(value=show_legend)
+        self.show_bottom_var = tk.BooleanVar(value=show_bottom)
+        self.show_top_var = tk.BooleanVar(value=show_top)
+
+        outer = ttk.Frame(self, padding=18, style="Panel.TFrame")
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="图层与页面", style="Section.TLabel").pack(anchor="w", pady=(0, 10))
+        card = ttk.Frame(outer, padding=16, style="Card.TFrame")
+        card.pack(fill="both", expand=True)
+        ttk.Label(card, text="图标题", style="CardHint.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Entry(card, textvariable=self.title_var).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 14))
+        ttk.Label(card, text="绘图区背景", style="CardHint.TLabel").grid(row=2, column=0, sticky="w")
+        self.plot_color_button = tk.Button(card, text="      ", bg=self.plot_color, relief="flat", command=self._choose_plot_color)
+        self.plot_color_button.grid(row=3, column=0, sticky="w", pady=(4, 14))
+        ttk.Label(card, text="页面背景", style="CardHint.TLabel").grid(row=2, column=1, sticky="w", padx=(18, 0))
+        self.figure_color_button = tk.Button(card, text="      ", bg=self.figure_color, relief="flat", command=self._choose_figure_color)
+        self.figure_color_button.grid(row=3, column=1, sticky="w", padx=(18, 0), pady=(4, 14))
+        ttk.Checkbutton(card, text="显示网格", variable=self.show_grid_var).grid(row=4, column=0, sticky="w", pady=3)
+        ttk.Checkbutton(card, text="显示图例", variable=self.show_legend_var).grid(row=4, column=1, sticky="w", pady=3)
+        ttk.Checkbutton(card, text="显示下方时间轴", variable=self.show_bottom_var).grid(row=5, column=0, sticky="w", pady=3)
+        ttk.Checkbutton(card, text="显示上方圈数 / 圈号", variable=self.show_top_var).grid(row=5, column=1, sticky="w", pady=3)
+        ttk.Label(
+            card,
+            text="单独轴的范围、主刻度和网格线样式，请直接双击对应坐标轴。",
+            style="CardHint.TLabel",
+            wraplength=410,
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(14, 0))
+        card.columnconfigure(0, weight=1)
+        card.columnconfigure(1, weight=1)
+
+        buttons = ttk.Frame(outer, style="Panel.TFrame")
+        buttons.pack(fill="x", pady=(15, 0))
+        ttk.Button(buttons, text="取消", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="确定", command=self._accept, style="Accent.TButton").pack(side="right", padx=(0, 8))
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+    def _choose_plot_color(self) -> None:
+        color = colorchooser.askcolor(self.plot_color, parent=self, title="选择绘图区背景")[1]
+        if color:
+            self.plot_color = color
+            self.plot_color_button.configure(bg=color, activebackground=color)
+
+    def _choose_figure_color(self) -> None:
+        color = colorchooser.askcolor(self.figure_color, parent=self, title="选择页面背景")[1]
+        if color:
+            self.figure_color = color
+            self.figure_color_button.configure(bg=color, activebackground=color)
+
+    def _accept(self) -> None:
+        self.result = {
+            "title": self.title_var.get().strip(),
+            "figure_background": self.figure_color,
+            "plot_background": self.plot_color,
+            "show_grid": self.show_grid_var.get(),
+            "show_legend": self.show_legend_var.get(),
+            "show_bottom": self.show_bottom_var.get(),
+            "show_top": self.show_top_var.get(),
+        }
+        self.destroy()
+
+
 class DataExportDialog(tk.Toplevel):
     def __init__(
         self,
@@ -1926,6 +2421,12 @@ class LandtWorkbenchApp(tk.Tk):
         self.curve_styles = {
             metric.key: CurveStyle(metric.default_color, metric.default_style) for metric in METRICS
         }
+        self.axis_styles: dict[str, AxisStyle] = {
+            "time": AxisStyle(),
+            "cycle": AxisStyle(),
+            **{f"y:{metric.key}": AxisStyle() for metric in METRICS},
+        }
+        self.plot_appearance = PlotAppearance()
         self.plot_metric_keys: list[str] = []
 
         self.status_var = tk.StringVar(value="就绪")
@@ -2082,11 +2583,17 @@ class LandtWorkbenchApp(tk.Tk):
         self.figure = Figure(figsize=(10, 7), dpi=100)
         self.canvas = FigureCanvasTkAgg(self.figure, master=parent)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas.mpl_connect("button_press_event", self._on_plot_double_click)
         toolbar_frame = ttk.Frame(parent, style="Card.TFrame")
         toolbar_frame.pack(fill="x")
         nav = NavigationToolbar2Tk(self.canvas, toolbar_frame, pack_toolbar=False)
         nav.update()
         nav.pack(side="left", fill="x")
+        ttk.Label(
+            toolbar_frame,
+            text="双击曲线、坐标轴或绘图区可直接编辑",
+            style="CardHint.TLabel",
+        ).pack(side="right", padx=(8, 12))
 
     def _build_settings_panel(self, parent: ttk.Frame) -> None:
         scroll = ScrollableFrame(parent)
@@ -2590,6 +3097,195 @@ class LandtWorkbenchApp(tk.Tk):
         if redraw:
             self.draw_current_plot()
 
+    def _on_plot_double_click(self, event: Any) -> None:
+        """Route a Matplotlib double-click to the curve, axis, or layer editor."""
+        if not getattr(event, "dblclick", False) or getattr(event, "button", None) != 1:
+            return
+
+        for axis in reversed(self.figure.axes):
+            for line in reversed(axis.lines):
+                metric_key = getattr(line, "_landt_metric_key", None)
+                if not metric_key:
+                    continue
+                try:
+                    contains, _details = line.contains(event)
+                except Exception:
+                    contains = False
+                if contains:
+                    self.after_idle(lambda key=metric_key: self._open_curve_properties(key))
+                    return
+
+        axis_hit = self._detect_axis_hit(event)
+        if axis_hit is not None:
+            role, metric_key, axis = axis_hit
+            self.after_idle(lambda: self._open_axis_properties(role, metric_key, axis))
+            return
+
+        self.after_idle(self._open_layer_properties)
+
+    def _detect_axis_hit(self, event: Any) -> tuple[Literal["time", "cycle", "y"], str | None, Any] | None:
+        """Find the nearest visible spine/tick region in display-pixel coordinates."""
+        if event.x is None or event.y is None:
+            return None
+        candidates: list[tuple[float, Literal["time", "cycle", "y"], str | None, Any]] = []
+        for axis in self.figure.axes:
+            bbox = axis.bbox
+            x_role = getattr(axis, "_landt_x_role", None)
+            if x_role and bbox.x0 - 8 <= event.x <= bbox.x1 + 8:
+                top_visible = axis.spines["top"].get_visible()
+                target_y = bbox.y1 if x_role == "cycle" and top_visible else bbox.y0
+                candidates.append((abs(event.y - target_y), x_role, None, axis))
+            if getattr(axis, "_landt_has_cycle_overlay", False) and bbox.x0 - 8 <= event.x <= bbox.x1 + 8:
+                candidates.append((abs(event.y - bbox.y1), "cycle", None, axis))
+
+            metric_key = getattr(axis, "_landt_metric_key", None)
+            if metric_key and bbox.y0 - 8 <= event.y <= bbox.y1 + 8:
+                for side in ("left", "right"):
+                    spine = axis.spines[side]
+                    if not spine.get_visible():
+                        continue
+                    try:
+                        vertices = spine.get_transform().transform(spine.get_path().vertices)
+                        target_x = float(np.nanmedian(vertices[:, 0]))
+                    except Exception:
+                        target_x = bbox.x0 if side == "left" else bbox.x1
+                    candidates.append((abs(event.x - target_x), "y", metric_key, axis))
+
+        if not candidates:
+            return None
+        distance, role, metric_key, axis = min(candidates, key=lambda item: item[0])
+        if distance > 62:
+            return None
+        return role, metric_key, axis
+
+    def _open_curve_properties(self, metric_key: str) -> None:
+        if metric_key not in METRIC_BY_KEY:
+            return
+        dialog = CurvePropertiesDialog(self, METRIC_BY_KEY[metric_key], self.curve_styles[metric_key])
+        self.wait_window(dialog)
+        if not dialog.result:
+            return
+        style = self.curve_styles[metric_key]
+        style.color = dialog.result["color"]
+        style.plot_type = dialog.result["plot_type"]
+        style.line_width = dialog.result["line_width"]
+        style.marker_size = dialog.result["marker_size"]
+        style.side = dialog.result["side"]
+        style.offset = dialog.result["offset"]
+        style.axis_visible = dialog.result["axis_visible"]
+        self.style_metric_var.set(METRIC_BY_KEY[metric_key].display)
+        self._load_style_form()
+        self.status_var.set(f"已更新曲线：{METRIC_BY_KEY[metric_key].display}")
+        self.draw_current_plot()
+
+    def _open_axis_properties(
+        self,
+        role: Literal["time", "cycle", "y"],
+        metric_key: str | None,
+        axis: Any,
+    ) -> None:
+        time_factor, time_label = time_factor_and_label(self.time_unit_var.get())
+        if role == "time":
+            config_key = "time"
+            title = time_label
+            current_bounds = tuple(float(value) for value in axis.get_xlim())
+            visible = self.show_bottom_var.get()
+            display_factor = time_factor
+            unit = self.time_unit_var.get()
+            default_grid = self.show_grid_var.get()
+        elif role == "cycle":
+            config_key = "cycle"
+            title = "圈数轴 Cycle"
+            current_bounds = (float(self.plot_cycle_start_var.get()), float(self.plot_cycle_end_var.get()))
+            visible = self.show_top_var.get()
+            display_factor = 1.0
+            unit = "圈"
+            default_grid = self.show_grid_var.get()
+        else:
+            if metric_key is None or metric_key not in METRIC_BY_KEY:
+                return
+            config_key = f"y:{metric_key}"
+            title = METRIC_BY_KEY[metric_key].display
+            current_bounds = tuple(float(value) for value in axis.get_ylim())
+            visible = self.curve_styles[metric_key].axis_visible
+            display_factor = 1.0
+            unit = METRIC_BY_KEY[metric_key].unit
+            visible_keys = self._visible_metric_keys_for_mode()
+            default_grid = self.show_grid_var.get() and bool(visible_keys) and metric_key == visible_keys[0]
+
+        dialog = AxisPropertiesDialog(
+            self,
+            title,
+            role,
+            self.axis_styles[config_key],
+            current_bounds,
+            visible,
+            display_factor=display_factor,
+            unit=unit,
+            default_grid=default_grid,
+        )
+        self.wait_window(dialog)
+        if not dialog.result:
+            return
+        config = self.axis_styles[config_key]
+        for field_name in (
+            "minimum",
+            "maximum",
+            "major_interval",
+            "grid_visible",
+            "grid_color",
+            "grid_line_style",
+            "grid_line_width",
+        ):
+            setattr(config, field_name, dialog.result[field_name])
+        if role == "time":
+            self.show_bottom_var.set(dialog.result["visible"])
+        elif role == "cycle":
+            self.plot_cycle_start_var.set(int(round(dialog.result["minimum"])))
+            self.plot_cycle_end_var.set(int(round(dialog.result["maximum"])))
+            self.show_top_var.set(dialog.result["visible"])
+            self._update_range_hint()
+        elif metric_key is not None:
+            self.curve_styles[metric_key].axis_visible = dialog.result["visible"]
+            if self.style_metric_var.get() == METRIC_BY_KEY[metric_key].display:
+                self._load_style_form()
+        self.status_var.set(f"已更新坐标轴：{title}")
+        self.draw_current_plot()
+
+    def _open_layer_properties(self) -> None:
+        dialog = PlotLayerPropertiesDialog(
+            self,
+            self.title_var.get(),
+            self.plot_appearance,
+            self.show_grid_var.get(),
+            self.show_legend_var.get(),
+            self.show_bottom_var.get(),
+            self.show_top_var.get(),
+        )
+        self.wait_window(dialog)
+        if not dialog.result:
+            return
+        self.title_var.set(dialog.result["title"] or "LAND electrochemical data")
+        self.plot_appearance.figure_background = dialog.result["figure_background"]
+        self.plot_appearance.plot_background = dialog.result["plot_background"]
+        self.show_grid_var.set(dialog.result["show_grid"])
+        self.show_legend_var.set(dialog.result["show_legend"])
+        self.show_bottom_var.set(dialog.result["show_bottom"])
+        self.show_top_var.set(dialog.result["show_top"])
+        self.status_var.set("已更新图层属性。")
+        self.draw_current_plot()
+
+    def _current_mode(self) -> Literal["time", "statistics", "stack"]:
+        return PLOT_MODE_LABELS.get(self.plot_mode_var.get(), "time")  # type: ignore[return-value]
+
+    def _visible_metric_keys_for_mode(self) -> list[str]:
+        mode = self._current_mode()
+        if mode == "statistics":
+            return _cycle_metric_keys(self.plot_metric_keys)
+        if mode == "stack":
+            return _record_metric_keys(self.plot_metric_keys)
+        return list(self.plot_metric_keys)
+
     def current_plot_options(self) -> PlotOptions:
         cycle_start = int(self.plot_cycle_start_var.get())
         cycle_end = int(self.plot_cycle_end_var.get())
@@ -2608,6 +3304,8 @@ class LandtWorkbenchApp(tk.Tk):
             show_grid=self.show_grid_var.get(),
             show_legend=self.show_legend_var.get(),
             max_points_per_curve=max(1000, int(self.max_points_var.get())),
+            axis_styles=self.axis_styles,
+            appearance=self.plot_appearance,
         )
 
     def draw_current_plot(self) -> None:
@@ -2808,6 +3506,32 @@ def run_self_test(source_dir: str | Path, output_dir: str | Path) -> int:
     save_figure(figure, output / "self_test_plot.svg", dpi=160)
     if os.name == "nt":
         save_figure(figure, output / "self_test_plot.emf", dpi=160)
+
+    customized_figure = Figure(figsize=(11, 6), dpi=110)
+    customized_axes = draw_plot(
+        customized_figure,
+        subsets[:1],
+        ["voltage_v", "current_ma"],
+        styles,
+        PlotOptions(
+            title="Origin-like editable properties self-test",
+            cycle_start=1,
+            cycle_end=5,
+            axis_styles={
+                "time": AxisStyle(minimum=0, maximum=10_800, major_interval=1_800, grid_visible=True, grid_line_style="--"),
+                "cycle": AxisStyle(major_interval=2, grid_visible=True, grid_line_style=":"),
+                "y:voltage_v": AxisStyle(minimum=1.05, maximum=1.95, major_interval=0.1, grid_visible=True),
+                "y:current_ma": AxisStyle(minimum=-0.1, maximum=2.2, major_interval=0.5, grid_visible=False),
+            },
+            appearance=PlotAppearance(figure_background="#EEF2FF", plot_background="#FFFEF7"),
+        ),
+        subsets[0],
+    )
+    if not np.allclose(customized_axes[0].get_xlim(), (0.0, 3.0)):
+        raise AssertionError("时间轴自定义显示范围未生效。")
+    if not np.allclose(customized_axes[0].get_ylim(), (1.05, 1.95)):
+        raise AssertionError("Y 轴自定义显示范围未生效。")
+    save_figure(customized_figure, output / "self_test_origin_properties.png", dpi=160)
     export_selected_data(
         subsets,
         metric_keys,
@@ -2960,6 +3684,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         app.withdraw()
         app.update_idletasks()
         app.update()
+        dialogs = [
+            CurvePropertiesDialog(app, METRIC_BY_KEY["voltage_v"], app.curve_styles["voltage_v"]),
+            AxisPropertiesDialog(app, "电压 (V)", "y", app.axis_styles["y:voltage_v"], (1.0, 2.0), True, unit="V"),
+            PlotLayerPropertiesDialog(app, app.title_var.get(), app.plot_appearance, True, True, True, True),
+        ]
+        for dialog in dialogs:
+            dialog.update_idletasks()
+            dialog.destroy()
         app.destroy()
         return 0
     app.mainloop()
